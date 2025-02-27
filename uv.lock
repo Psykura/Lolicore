@@ -517,6 +517,14 @@ wheels = [
 ]
 
 [[package]]
+name = "libtpu"
+version = "0.0.10"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bc/3a/23e4ff7378f2c581988013eff0528b3a935e5eda4bc6b61857c0ebe9a740/libtpu-0.0.10-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:50917a43a9b634c36593f175acb3f939ace21ea23cb31ee78e52cfe5b1b17245", size = 129678970 },
+]
+
+[[package]]
 name = "lolicore"
 version = "0.1.0"
 source = { virtual = "." }
@@ -524,6 +532,7 @@ dependencies = [
     { name = "datasets" },
     { name = "flax" },
     { name = "jax" },
+    { name = "libtpu" },
     { name = "optax" },
     { name = "orbax-checkpoint" },
     { name = "orbax-export" },
@@ -537,6 +546,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=3.3.2" },
     { name = "flax", specifier = "==0.10.3" },
     { name = "jax", specifier = "==0.5.0" },
+    { name = "libtpu", specifier = ">=0.0.10" },
     { name = "optax", specifier = "==0.2.4" },
     { name = "orbax-checkpoint", specifier = ">=0.11.6" },
     { name = "orbax-export", specifier = ">=0.0.6" },
