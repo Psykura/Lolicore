@@ -22,8 +22,8 @@ from jax.experimental.multihost_utils import sync_global_devices
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
 
 # Constants
-CONTEXT_LENGTH = 512
-BATCH_SIZE = 8
+CONTEXT_LENGTH = 1024
+BATCH_SIZE = 64
 NUM_EPOCHS = 5
 LEARNING_RATE = 1e-4
 WARMUP_STEPS = 100
@@ -41,13 +41,13 @@ MODEL_CONFIG = {
     'hidden_size': 2048,
     'max_seq_length': CONTEXT_LENGTH,
     'vocab_size': vocab_size,  # GPT-2 vocab size
-    'num_experts': 16,
+    'num_experts': 24,
     'num_shared_experts': 1,
     'top_k': 4,
     'use_gradient_checkpointing': True,
     'attention_latent_dim': 32,
     'num_zeros_experts': 1,
-    'num_constant_experts': 2,
+    'num_constant_experts': 3,
     'num_noise_experts': 1,
 }
 
@@ -318,6 +318,9 @@ def create_mesh():
     return mesh, n_devices
 
 def main():
+    from jax_smi import initialise_tracking
+    initialise_tracking()
+
     CHECKPOINT_DIR = os.path.abspath("./checkpoints")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
