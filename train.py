@@ -364,7 +364,7 @@ def prefetch_batches(dataset_iterator, prefetch_size, mesh):
             break
         yield batch_idx, batch
 
-def main():        
+def main():
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True, cache_dir='./cache')
     
