@@ -594,8 +594,7 @@ def main():
             # First try with num_proc=0 to avoid multiprocessing issues
             batched_dataset = train_dataset.batch(
                 samples_per_step,
-                num_proc=0,  # Avoid multiprocessing to prevent fork() issues
-                drop_remainder=True
+                num_proc=0,
             )
             
             print(f"Process {process_index}: Dataset batched with {len(batched_dataset)} batches")
