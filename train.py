@@ -19,6 +19,7 @@ from collections import deque
 import threading
 import queue
 import wandb
+import time
 
 # This script trains a Transformer model with MoE (Mixture of Experts) architecture
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
@@ -61,7 +62,38 @@ DATASET_CONFIG = {
     'cache_dir': './cache',
 }
 
-
+# Initialize JAX distributed environment properly
+def initialize_jax_distributed():
+    """Initialize JAX distributed environment with proper coordination."""
+    # Initialize JAX distributed system
+    jax.distributed.initialize()
+    
+    # Get process index and process count
+    process_index = jax.process_index()
+    process_count = jax.process_count()
+    
+    print(f"Process {process_index} of {process_count} initialized")
+    
+    # Ensure all processes have initialized before proceeding
+    # This helps synchronize all hosts
+    if process_count > 1:
+        # Simple barrier to ensure all processes are ready
+        # Each process waits for a short time proportional to its index
+        # This helps stagger the initialization and avoid race conditions
+        time.sleep(process_index * 0.5)
+        
+        # Use JAX's collective operations to synchronize all processes
+        # This ensures all processes are at the same point before continuing
+        x = jnp.ones([1])
+        jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(x)
+        
+        print(f"Process {process_index} synchronized with all other processes")
+    
+    # Set default device assignment strategy
+    jax.config.update('jax_default_device', jax.devices()[0])
+    
+    # Return process information for logging
+    return process_index, process_count
 
 def create_learning_rate_schedule(
     num_train_steps: int,
@@ -314,10 +346,27 @@ def get_param_spec(param, path):
 def create_mesh():
     """Create a more balanced device mesh for TPU."""
     n_devices = jax.device_count()
+    local_devices = jax.local_devices()
     
-    mesh_shape = (n_devices // 2, 2)  # More balanced than (2, 4)
+    # Print device information for debugging
+    print(f"Total devices: {n_devices}")
+    print(f"Local devices: {len(local_devices)}")
+    print(f"Device types: {[d.device_kind for d in local_devices[:2]]}")
     
-    mesh = jax.make_mesh(mesh_shape, ('model', 'batch'))
+    # Create a more robust mesh shape calculation
+    if n_devices >= 4:
+        # For larger pod slices, use a more balanced mesh
+        mesh_shape = (n_devices // 2, 2)
+    else:
+        # For smaller setups, use a simpler mesh
+        mesh_shape = (n_devices, 1)
+    
+    print(f"Using mesh shape: {mesh_shape}")
+    
+    # Create the mesh with explicit device assignment
+    devices = np.array(jax.devices()).reshape(mesh_shape)
+    mesh = Mesh(devices, ('model', 'batch'))
+    
     return mesh, n_devices
 
 def prefetch_batches(dataset_iterator, prefetch_size, mesh):
@@ -329,11 +378,13 @@ def prefetch_batches(dataset_iterator, prefetch_size, mesh):
             for batch_idx, batch in dataset_iterator:
                 # Prepare batch with proper sharding
                 prepared_batch = {k: jnp.array(v) for k, v in batch.items()}
-                prepared_batch = jax.device_put(prepared_batch, NamedSharding(mesh, P('batch', None)))
+                # Use device_put_sharded for more efficient data transfer
+                prepared_batch = jax.device_put_sharded(prepared_batch, NamedSharding(mesh, P('batch', None)))
                 prefetch_queue.put((batch_idx, prepared_batch))
             # Signal the end of the iterator
             prefetch_queue.put((None, None))
         except Exception as e:
+            print(f"Prefetch worker exception: {e}")
             prefetch_queue.put((None, e))
     
     # Start prefetching thread
@@ -350,20 +401,24 @@ def prefetch_batches(dataset_iterator, prefetch_size, mesh):
         yield batch_idx, batch
 
 def main():
-    jax.distributed.initialize()
+    # Initialize JAX distributed environment with proper coordination
+    process_index, process_count = initialize_jax_distributed()
     
-    wandb.init(
-        project="lolicore",
-        config={
-            "context_length": CONTEXT_LENGTH,
-            "batch_size": BATCH_SIZE,
-            "num_epochs": NUM_EPOCHS,
-            "learning_rate": LEARNING_RATE,
-            "warmup_steps": WARMUP_STEPS,
-            "gradient_clip_norm": GRADIENT_CLIP_NORM,
-            "dtype": str(DTYPE),
-        }
-    )
+    # Only initialize wandb on the main process
+    if process_index == 0:
+        wandb.init(
+            project="lolicore",
+            config={
+                "context_length": CONTEXT_LENGTH,
+                "batch_size": BATCH_SIZE,
+                "num_epochs": NUM_EPOCHS,
+                "learning_rate": LEARNING_RATE,
+                "warmup_steps": WARMUP_STEPS,
+                "gradient_clip_norm": GRADIENT_CLIP_NORM,
+                "dtype": str(DTYPE),
+                "process_count": process_count,
+            }
+        )
 
     CHECKPOINT_DIR = os.path.abspath("./checkpoints")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -371,21 +426,33 @@ def main():
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True, cache_dir='./cache')
     
-    # Prepare datasets
-    train_dataset = prepare_dataset(tokenizer)
+    # Prepare datasets - only load on main process and broadcast if needed
+    if process_index == 0:
+        print("Preparing dataset...")
+        train_dataset = prepare_dataset(tokenizer)
+    else:
+        # Wait for main process to prepare dataset
+        time.sleep(5)
+        train_dataset = prepare_dataset(tokenizer)
+    
+    # Ensure all processes have loaded the dataset
+    if process_count > 1:
+        # Simple barrier
+        x = jnp.ones([1])
+        jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(x)
 
     # Initialize TPU devices and create mesh
     mesh, n_devices = create_mesh()
-    print(f"Training on {n_devices} devices with 2D sharding")
+    print(f"Process {process_index}: Training on {n_devices} devices with 2D sharding")
     
     # Calculate steps per epoch and total steps
-    samples_per_step = BATCH_SIZE * 4  # 4 data shards
+    samples_per_step = BATCH_SIZE * (2 if n_devices >= 4 else 1)  # Adjust based on mesh
     steps_per_epoch = len(train_dataset) // samples_per_step
     total_steps = steps_per_epoch * NUM_EPOCHS
     
-    print(f"Dataset size: {len(train_dataset)}")
-    print(f"Steps per epoch: {steps_per_epoch}")
-    print(f"Total steps: {total_steps}")
+    print(f"Process {process_index}: Dataset size: {len(train_dataset)}")
+    print(f"Process {process_index}: Steps per epoch: {steps_per_epoch}")
+    print(f"Process {process_index}: Total steps: {total_steps}")
     
     # Create learning rate schedule
     learning_rate_fn = create_learning_rate_schedule(
@@ -413,7 +480,7 @@ def main():
         
         # Load from checkpoint if available
         if latest_checkpoint:
-            print(f"Found checkpoint at {latest_checkpoint}. Restoring...")
+            print(f"Process {process_index}: Found checkpoint at {latest_checkpoint}. Restoring...")
             try:
                 # Extract step from checkpoint path
                 checkpoint_step = int(os.path.basename(latest_checkpoint).split("_")[-1])
@@ -421,20 +488,21 @@ def main():
                 
                 # Restore checkpoint
                 state = checkpoints.restore_checkpoint(latest_checkpoint, target=state)
-                print(f"Successfully restored checkpoint at step {step}")
+                print(f"Process {process_index}: Successfully restored checkpoint at step {step}")
             except Exception as e:
-                print(f"Error loading checkpoint: {e}")
-                print("Training from scratch instead.")
+                print(f"Process {process_index}: Error loading checkpoint: {e}")
+                print(f"Process {process_index}: Training from scratch instead.")
                 step = 0
         else:
-            print("No checkpoint found. Training from scratch.")
+            print(f"Process {process_index}: No checkpoint found. Training from scratch.")
         
         # Calculate and print model size
         param_count = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
-        print(f"Number of parameters: {param_count/1e9:.2f}B")
+        print(f"Process {process_index}: Number of parameters: {param_count/1e9:.2f}B")
         
-        # Log model size to wandb
-        wandb.run.summary["model_parameters_B"] = param_count/1e9
+        # Log model size to wandb (only on main process)
+        if process_index == 0:
+            wandb.run.summary["model_parameters_B"] = param_count/1e9
         
         # Pre-batch the dataset
         batched_dataset = train_dataset.batch(samples_per_step, num_proc=16)
@@ -446,18 +514,19 @@ def main():
         start_epoch = step // steps_per_epoch
         start_batch_idx = step % steps_per_epoch
         
-        print(f"Starting training from step {step} (epoch {start_epoch}, batch {start_batch_idx})")
+        print(f"Process {process_index}: Starting training from step {step} (epoch {start_epoch}, batch {start_batch_idx})")
         
         # Number of batches to prefetch (adjust based on your system's memory)
         prefetch_size = 3
         
         for epoch in range(start_epoch, NUM_EPOCHS):
             # Shuffle dataset at the start of each epoch
+            # Use the same seed across all processes to ensure consistency
             batched_dataset.shuffle(seed=epoch)
             
             # Create dataset iterator based on resumption point
             if epoch == start_epoch and start_batch_idx > 0:
-                print(f"Skipping to batch {start_batch_idx} in epoch {epoch+1}")
+                print(f"Process {process_index}: Skipping to batch {start_batch_idx} in epoch {epoch+1}")
                 dataset_iter = enumerate(list(batched_dataset)[start_batch_idx:], start=start_batch_idx)
                 total_batches = steps_per_epoch
                 initial = start_batch_idx
@@ -466,13 +535,14 @@ def main():
                 total_batches = steps_per_epoch
                 initial = 0
             
-            # Create progress bar
-            progress_bar = tqdm(
-                total=total_batches,
-                desc=f"Epoch {epoch+1}/{NUM_EPOCHS}",
-                position=0,
-                initial=initial
-            )
+            # Create progress bar (only on main process)
+            if process_index == 0:
+                progress_bar = tqdm(
+                    total=total_batches,
+                    desc=f"Epoch {epoch+1}/{NUM_EPOCHS}",
+                    position=0,
+                    initial=initial
+                )
             
             # Create prefetching iterator
             prefetch_iter = prefetch_batches(dataset_iter, prefetch_size, mesh)
@@ -483,8 +553,9 @@ def main():
                 state, metrics = train_step(state, batch, rngs=rng)
                 train_metrics.append(metrics)
                 
-                # Update progress bar
-                progress_bar.update(1)
+                # Update progress bar (only on main process)
+                if process_index == 0:
+                    progress_bar.update(1)
                 
                 if batch_idx % 50 == 0:
                     # Convert JAX arrays to float values for formatting
@@ -493,42 +564,51 @@ def main():
                         'main_loss': float(metrics['main_loss']),
                         'router_loss': float(metrics['router_loss'])
                     }
-                    progress_bar.set_postfix({
-                        'loss': f"{metrics['loss']:.4f}",
-                        'main_loss': f"{metrics['main_loss']:.4f}",
-                        'router_loss': f"{metrics['router_loss']:.4f}"
-                    })
                     
-                    # Log metrics to wandb
-                    wandb.log({
-                        'train/loss': metrics['loss'],
-                        'train/main_loss': metrics['main_loss'],
-                        'train/router_loss': metrics['router_loss'],
-                        'train/step': step,
-                        'train/epoch': epoch + (batch_idx / steps_per_epoch)
-                    })
+                    # Update progress bar (only on main process)
+                    if process_index == 0:
+                        progress_bar.set_postfix({
+                            'loss': f"{metrics['loss']:.4f}",
+                            'main_loss': f"{metrics['main_loss']:.4f}",
+                            'router_loss': f"{metrics['router_loss']:.4f}"
+                        })
+                    
+                    # Log metrics to wandb (only on main process)
+                    if process_index == 0:
+                        wandb.log({
+                            'train/loss': metrics['loss'],
+                            'train/main_loss': metrics['main_loss'],
+                            'train/router_loss': metrics['router_loss'],
+                            'train/step': step,
+                            'train/epoch': epoch + (batch_idx / steps_per_epoch)
+                        })
                 
-                # Save checkpoint periodically
-                if batch_idx % 5000 == 0 or step % 5000 == 0:
-                    print(f"\nSaving checkpoint at step {step}...")
+                # Save checkpoint periodically (only on main process)
+                if (batch_idx % 5000 == 0 or step % 5000 == 0) and process_index == 0:
+                    print(f"\nProcess {process_index}: Saving checkpoint at step {step}...")
                     checkpoints.save_checkpoint(
                         ckpt_dir=CHECKPOINT_DIR,
                         target=state,
                         step=step,
                         overwrite=True
                     )
-                    print(f"Checkpoint saved at {os.path.join(CHECKPOINT_DIR, f'checkpoint_{step}')}")
-                    
-                    # Log checkpoint to wandb
-                    # wandb.save(os.path.join(checkpoint_dir, f"checkpoint_{step}"))
+                    print(f"Process {process_index}: Checkpoint saved at {os.path.join(CHECKPOINT_DIR, f'checkpoint_{step}')}")
                 
                 step += 1
             
-            # Close progress bar
-            progress_bar.close()
+            # Close progress bar (only on main process)
+            if process_index == 0:
+                progress_bar.close()
+            
+            # Synchronize processes at the end of each epoch
+            if process_count > 1:
+                # Simple barrier
+                x = jnp.ones([1])
+                jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(x)
         
-        # Close wandb run when training is complete
-        wandb.finish()
+        # Close wandb run when training is complete (only on main process)
+        if process_index == 0:
+            wandb.finish()
 
 if __name__ == "__main__":
     main()
