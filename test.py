@@ -19,13 +19,13 @@ MODEL_CONFIG = {
     'd_model': 512,
     'hidden_size': 2048,
     'max_seq_length': CONTEXT_LENGTH,
-    'vocab_size': PADDED_VOCAB_SIZE,  # Use padded vocab size
+    'vocab_size': PADDED_VOCAB_SIZE,  # GPT-2 vocab size
     'num_experts': 16,
     'num_shared_experts': 1,
     'top_k': 4,
     'use_gradient_checkpointing': False,
     'training': False,
-    'attention_latent_dim': 128,
+    'attention_latent_dim': 32,
     'num_zeros_experts': 1,
     'num_constant_experts': 2,
     'num_noise_experts': 1,
@@ -38,7 +38,7 @@ def create_model():
 def load_model():
     """Load model from checkpoint."""
     # Try to use unsharded checkpoint first
-    unsharded_dir = os.path.abspath("./checkpoints/checkpoint_10000")
+    unsharded_dir = os.path.abspath("./checkpoints/checkpoint_20000")
     
     # Initialize model with the same config as during training
     model = Transformer(
@@ -129,6 +129,7 @@ def main():
         "Once upon a time",
         "The future of artificial intelligence",
         "In a world where technology",
+        "The capital of France is",
     ]
     
     print("\nGenerating text from prompts:")

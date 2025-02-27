@@ -100,9 +100,6 @@ class MultiHeadAttention(nn.Module):
     use_gradient_checkpointing: bool = False
 
     def setup(self):
-        if self.d_model % self.num_heads != 0:
-            raise ValueError(f"d_model ({self.d_model}) must be divisible by num_heads ({self.num_heads})")
-            
         self.head_dim = self.latent_dim * self.num_heads
         
         # Initialize rotary embeddings
@@ -230,7 +227,7 @@ class Router(nn.Module):
         
         if not self.training:
             return indices, weights, 0.0
-            
+        
         # Calculate balance loss
         expert_mask = jax.nn.one_hot(indices, self.num_experts)
         expert_usage = expert_mask * weights[..., None]
@@ -364,7 +361,7 @@ class ExpertsFeedForward(nn.Module):
             output += shared_output / len(self.shared_experts)
 
         # Choose computation path based on training mode
-        if self.training:
+        if True: #self.training:
             output += self._compute_training_path(
                 grouped_x, expert_indices, routing_weights, expert_capacity
             )

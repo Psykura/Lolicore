@@ -20,6 +20,7 @@ import threading
 import queue
 import wandb
 import time
+from jax.experimental import multihost_utils
 
 # This script trains a Transformer model with MoE (Mixture of Experts) architecture
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
@@ -85,11 +86,11 @@ def initialize_jax_distributed():
         # This helps stagger the initialization and avoid race conditions
         time.sleep(process_index * 0.5)
         
-        # Use JAX's collective operations to synchronize all processes
-        # Create an array with shape matching the number of local devices
-        xs = jnp.ones(local_device_count)
-        # The psum is performed over all mapped devices across the Pod
-        r = jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(xs)
+        # Use multihost_utils for better synchronization across hosts
+        print(f"Process {process_index} waiting for synchronization...")
+        
+        # Synchronize all hosts using a simple value
+        multihost_utils.sync_global_devices("init")
         
         print(f"Process {process_index} synchronized with all other processes")
     
@@ -444,9 +445,9 @@ def main():
     
     # Ensure all processes have loaded the dataset
     if process_count > 1:
-        # Synchronize using pmap and psum
-        xs = jnp.ones(local_device_count)
-        r = jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(xs)
+        # Use multihost_utils for better synchronization across hosts
+        print(f"Process {process_index} waiting for dataset synchronization...")
+        multihost_utils.sync_global_devices("dataset_loaded")
         print(f"Process {process_index}: Dataset loading synchronized")
 
     # Initialize TPU devices and create mesh
@@ -610,9 +611,9 @@ def main():
             
             # Synchronize processes at the end of each epoch
             if process_count > 1:
-                # Synchronize using pmap and psum
-                xs = jnp.ones(local_device_count)
-                r = jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(xs)
+                # Use multihost_utils for better synchronization across hosts
+                print(f"Process {process_index} waiting for end-of-epoch synchronization...")
+                multihost_utils.sync_global_devices(f"epoch_{epoch}_complete")
                 print(f"Process {process_index}: End of epoch {epoch+1} synchronized")
         
         # Close wandb run when training is complete (only on main process)
