@@ -23,7 +23,7 @@ from jax.experimental.multihost_utils import sync_global_devices
 
 # Constants
 CONTEXT_LENGTH = 1024
-BATCH_SIZE = 64
+BATCH_SIZE = 16
 NUM_EPOCHS = 5
 LEARNING_RATE = 1e-4
 WARMUP_STEPS = 100
