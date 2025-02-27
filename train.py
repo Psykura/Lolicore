@@ -86,17 +86,10 @@ def initialize_jax_distributed():
         time.sleep(process_index * 0.5)
         
         # Use JAX's collective operations to synchronize all processes
-        # This ensures all processes are at the same point before continuing
         # Create an array with shape matching the number of local devices
-        x = jnp.ones((local_device_count,))
-        
-        # Define a simple pmap function for synchronization
-        @jax.pmap
-        def sync_hosts(x):
-            return jax.lax.psum(x, 'i')
-        
-        # Execute the pmap function
-        sync_hosts(x)
+        xs = jnp.ones(local_device_count)
+        # The psum is performed over all mapped devices across the Pod
+        r = jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(xs)
         
         print(f"Process {process_index} synchronized with all other processes")
     
@@ -389,8 +382,8 @@ def prefetch_batches(dataset_iterator, prefetch_size, mesh):
             for batch_idx, batch in dataset_iterator:
                 # Prepare batch with proper sharding
                 prepared_batch = {k: jnp.array(v) for k, v in batch.items()}
-                # Use device_put_sharded for more efficient data transfer
-                prepared_batch = jax.device_put_sharded(prepared_batch, NamedSharding(mesh, P('batch', None)))
+                # Use device_put with proper sharding
+                prepared_batch = jax.device_put(prepared_batch, NamedSharding(mesh, P('batch', None)))
                 prefetch_queue.put((batch_idx, prepared_batch))
             # Signal the end of the iterator
             prefetch_queue.put((None, None))
@@ -414,6 +407,9 @@ def prefetch_batches(dataset_iterator, prefetch_size, mesh):
 def main():
     # Initialize JAX distributed environment with proper coordination
     process_index, process_count = initialize_jax_distributed()
+    
+    # Get local device count for synchronization
+    local_device_count = jax.local_device_count()
     
     # Only initialize wandb on the main process
     if process_index == 0:
@@ -448,9 +444,10 @@ def main():
     
     # Ensure all processes have loaded the dataset
     if process_count > 1:
-        # Simple barrier
-        x = jnp.ones([1])
-        jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(x)
+        # Synchronize using pmap and psum
+        xs = jnp.ones(local_device_count)
+        r = jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(xs)
+        print(f"Process {process_index}: Dataset loading synchronized")
 
     # Initialize TPU devices and create mesh
     mesh, n_devices = create_mesh()
@@ -613,9 +610,10 @@ def main():
             
             # Synchronize processes at the end of each epoch
             if process_count > 1:
-                # Simple barrier
-                x = jnp.ones([1])
-                jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(x)
+                # Synchronize using pmap and psum
+                xs = jnp.ones(local_device_count)
+                r = jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(xs)
+                print(f"Process {process_index}: End of epoch {epoch+1} synchronized")
         
         # Close wandb run when training is complete (only on main process)
         if process_index == 0:
