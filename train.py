@@ -16,6 +16,7 @@ from flax.training import checkpoints
 from tqdm import tqdm
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 import wandb
+from jax.experimental.multihost_utils import sync_global_devices
 
 # This script trains a Transformer model with MoE (Mixture of Experts) architecture
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
@@ -311,7 +312,7 @@ def create_mesh():
     devices = jax.devices()
     n_devices = len(devices)
 
-    mesh_shape = (n_devices // 2, 2)  # More balanced than (2, 4)
+    mesh_shape = (n_devices // 2, 2) 
 
     mesh = jax.make_mesh(mesh_shape, ('model', 'batch'))
     return mesh, n_devices
@@ -319,28 +320,37 @@ def create_mesh():
 def main():
     CHECKPOINT_DIR = os.path.abspath("./checkpoints")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    # Initialize wandb
-    wandb.init(
-        project="lolicore",
-        config={
-            "context_length": CONTEXT_LENGTH,
-            "batch_size": BATCH_SIZE,
-            "num_epochs": NUM_EPOCHS,
-            "learning_rate": LEARNING_RATE,
-            "warmup_steps": WARMUP_STEPS,
-            "gradient_clip_norm": GRADIENT_CLIP_NORM,
-            "dtype": str(DTYPE),
-        }
-    )
+
+    if jax.process_index() == 0:
+        # Initialize wandb
+        wandb.init(
+            project="lolicore",
+            config={
+                "context_length": CONTEXT_LENGTH,
+                "batch_size": BATCH_SIZE,
+                "num_epochs": NUM_EPOCHS,
+                "learning_rate": LEARNING_RATE,
+                "warmup_steps": WARMUP_STEPS,
+                "gradient_clip_norm": GRADIENT_CLIP_NORM,
+                "dtype": str(DTYPE),
+            }
+        )
+
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True, cache_dir='./cache')
 
     # Prepare datasets
     train_dataset = prepare_dataset(tokenizer)
 
+    print(f"Syncing start state for process {jax.process_index()}")
+    sync_global_devices('train')
+
     # Initialize TPU devices and create mesh
     mesh, n_devices = create_mesh()
     print(f"Training on {n_devices} devices with 2D sharding")
+
+    print(f"Syncing mesh for process {jax.process_index()}")
+    sync_global_devices('mesh_created')
 
     # Calculate steps per epoch and total steps
     samples_per_step = BATCH_SIZE * 4  # 4 data shards
@@ -374,6 +384,9 @@ def main():
             learning_rate_fn=learning_rate_fn
         )
 
+        print(f"Syncing training state for process {jax.process_index()}")
+        sync_global_devices('training_state_created')
+
         # Load from checkpoint if available
         if latest_checkpoint:
             print(f"Found checkpoint at {latest_checkpoint}. Restoring...")
@@ -392,12 +405,16 @@ def main():
         else:
             print("No checkpoint found. Training from scratch.")
 
+        print(f"Syncing checkpoint loaded for process {jax.process_index()}")
+        sync_global_devices('checkpoint_loaded')
+
         # Calculate and print model size
         param_count = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
         print(f"Number of parameters: {param_count/1e9:.2f}B")
 
         # Log model size to wandb
-        wandb.run.summary["model_parameters_B"] = param_count/1e9
+        if jax.process_index() == 0:
+            wandb.run.summary["model_parameters_B"] = param_count/1e9
 
         # Pre-batch the dataset
         batched_dataset = train_dataset.batch(samples_per_step, num_proc=16)
@@ -409,11 +426,17 @@ def main():
         start_epoch = step // steps_per_epoch
         start_batch_idx = step % steps_per_epoch
 
+        print(f"Syncing starting training for process {jax.process_index()}")
+        sync_global_devices('starting_training')
+
         print(f"Starting training from step {step} (epoch {start_epoch}, batch {start_batch_idx})")
 
         for epoch in range(start_epoch, NUM_EPOCHS):
             # Shuffle dataset at the start of each epoch
             batched_dataset.shuffle(seed=epoch)
+
+            print(f"Syncing epoch {epoch} for process {jax.process_index()}")
+            sync_global_devices(f'epoch_{epoch}')
 
             # Create tqdm progress bar for each epoch
             progress_bar = tqdm(
@@ -457,19 +480,20 @@ def main():
                         'router_loss': f"{metrics['router_loss']:.4f}"
                     })
 
-                    # Log metrics to wandb
-                    wandb.log({
-                        'train/loss': metrics['loss'],
-                        'train/main_loss': metrics['main_loss'],
-                        'train/router_loss': metrics['router_loss'],
-                        'train/step': step,
-                        'train/epoch': epoch + (batch_idx / steps_per_epoch)
-                    })
+                    if jax.process_index() == 0:
+                        # Log metrics to wandb
+                        wandb.log({
+                            'train/loss': metrics['loss'],
+                            'train/main_loss': metrics['main_loss'],
+                            'train/router_loss': metrics['router_loss'],
+                            'train/step': step,
+                            'train/epoch': epoch + (batch_idx / steps_per_epoch)
+                        })
 
                 # Save checkpoint periodically
                 if batch_idx % 5000 == 0 or step % 5000 == 0:
                     print(f"\nSaving checkpoint at step {step}...")
-                    checkpoints.save_checkpoint(
+                    checkpoints.save_checkpoint_multiprocess(
                         ckpt_dir=CHECKPOINT_DIR,
                         target=state,
                         step=step,
@@ -477,13 +501,11 @@ def main():
                     )
                     print(f"Checkpoint saved at {os.path.join(CHECKPOINT_DIR, f'checkpoint_{step}')}")
 
-                    # Log checkpoint to wandb
-                    # wandb.save(os.path.join(checkpoint_dir, f"checkpoint_{step}"))
-
                 step += 1
 
         # Close wandb run when training is complete
-        wandb.finish()
+        if jax.process_index() == 0:
+            wandb.finish()
 
 if __name__ == "__main__":
     main()
