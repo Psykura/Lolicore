@@ -1,0 +1,14 @@
+[project]
+name = "lolicore"
+version = "0.1.0"
+description = "Simple, Playable and Flexible Language Model"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=3.3.2",
+    "flax>=0.10.3",
+    "jax-metal>=0.1.1",
+    "optax>=0.2.4",
+    "transformers>=4.49.0",
+    "wandb>=0.19.7",
+]
