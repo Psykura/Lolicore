@@ -32,20 +32,6 @@ WARMUP_STEPS = 100
 GRADIENT_CLIP_NORM = 1.0
 DTYPE = jnp.bfloat16  # Set default dtype to bfloat16
 
-# Initialize wandb
-wandb.init(
-    project="lolicore",
-    config={
-        "context_length": CONTEXT_LENGTH,
-        "batch_size": BATCH_SIZE,
-        "num_epochs": NUM_EPOCHS,
-        "learning_rate": LEARNING_RATE,
-        "warmup_steps": WARMUP_STEPS,
-        "gradient_clip_norm": GRADIENT_CLIP_NORM,
-        "dtype": str(DTYPE),
-    }
-)
-
 vocab_size = 50257
 vocab_size = ((vocab_size + 127) // 128) * 128
 
@@ -75,8 +61,7 @@ DATASET_CONFIG = {
     'cache_dir': './cache',
 }
 
-CHECKPOINT_DIR = os.path.abspath("./checkpoints")
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
 
 def create_learning_rate_schedule(
     num_train_steps: int,
@@ -365,6 +350,24 @@ def prefetch_batches(dataset_iterator, prefetch_size, mesh):
         yield batch_idx, batch
 
 def main():
+    jax.distributed.initialize()
+    
+    wandb.init(
+        project="lolicore",
+        config={
+            "context_length": CONTEXT_LENGTH,
+            "batch_size": BATCH_SIZE,
+            "num_epochs": NUM_EPOCHS,
+            "learning_rate": LEARNING_RATE,
+            "warmup_steps": WARMUP_STEPS,
+            "gradient_clip_norm": GRADIENT_CLIP_NORM,
+            "dtype": str(DTYPE),
+        }
+    )
+
+    CHECKPOINT_DIR = os.path.abspath("./checkpoints")
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True, cache_dir='./cache')
     
