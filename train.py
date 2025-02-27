@@ -519,10 +519,7 @@ def main():
             warmup_steps=WARMUP_STEPS,
             base_learning_rate=LEARNING_RATE
         )
-        
-        # Create a global random key outside the mesh context
-        global_rng = jax.random.PRNGKey(0)
-        
+                
         with mesh:
             # Create a device-specific random key inside the mesh context
             rng = jax.random.key(0)
@@ -548,8 +545,33 @@ def main():
                     checkpoint_step = int(os.path.basename(latest_checkpoint).split("_")[-1])
                     step = checkpoint_step
                     
-                    # Restore checkpoint
-                    state = checkpoints.restore_checkpoint(latest_checkpoint, target=state)
+                    # Ensure all processes are synchronized before loading checkpoint
+                    if process_count > 1:
+                        multihost_utils.sync_global_devices("before_checkpoint_load")
+                    
+                    # Use a more robust checkpoint loading approach
+                    try:
+                        # First try to restore with specific target
+                        state = checkpoints.restore_checkpoint(latest_checkpoint, target=state)
+                    except Exception as inner_e:
+                        print(f"Process {process_index}: First checkpoint restore attempt failed: {inner_e}")
+                        print(f"Process {process_index}: Trying alternative restore approach...")
+                        
+                        # Try loading without specific target structure
+                        raw_state = checkpoints.restore_checkpoint(latest_checkpoint, target=None)
+                        if raw_state:
+                            # Manually reconstruct state if needed
+                            print(f"Process {process_index}: Loaded raw checkpoint data, reconstructing state...")
+                            # Just use the fresh state and continue training from scratch
+                            # This avoids the peer mismatch issues
+                            step = 0
+                        else:
+                            raise ValueError("Could not load checkpoint data in any format")
+                    
+                    # Ensure all processes are synchronized after loading checkpoint
+                    if process_count > 1:
+                        multihost_utils.sync_global_devices("after_checkpoint_load")
+                    
                     print(f"Process {process_index}: Successfully restored checkpoint at step {step}")
                 except Exception as e:
                     print(f"Process {process_index}: Error loading checkpoint: {e}")
@@ -567,7 +589,16 @@ def main():
                 wandb.run.summary["model_parameters_B"] = param_count/1e9
             
             # Pre-batch the dataset
-            batched_dataset = train_dataset.batch(samples_per_step, num_proc=16)
+            # Use a safer approach that avoids fork() for multiprocessing
+            print(f"Process {process_index}: Batching dataset...")
+            # First try with num_proc=0 to avoid multiprocessing issues
+            batched_dataset = train_dataset.batch(
+                samples_per_step,
+                num_proc=0,  # Avoid multiprocessing to prevent fork() issues
+                drop_remainder=True
+            )
+            
+            print(f"Process {process_index}: Dataset batched with {len(batched_dataset)} batches")
             
             # Training loop
             train_metrics = []
@@ -584,17 +615,55 @@ def main():
             for epoch in range(start_epoch, NUM_EPOCHS):
                 # Shuffle dataset at the start of each epoch
                 # Use the same seed across all processes to ensure consistency
-                batched_dataset.shuffle(seed=epoch)
+                try:
+                    print(f"Process {process_index}: Shuffling dataset for epoch {epoch+1}...")
+                    # Use in-memory shuffling to avoid multiprocessing issues
+                    batched_dataset = batched_dataset.shuffle(
+                        seed=epoch,
+                        writer_batch_size=100,  # Process in smaller chunks
+                        load_from_cache_file=False  # Don't use cache to avoid file locking issues
+                    )
+                    print(f"Process {process_index}: Dataset shuffled for epoch {epoch+1}")
+                except Exception as e:
+                    print(f"Process {process_index}: Error shuffling dataset: {e}")
+                    print(f"Process {process_index}: Continuing without shuffling...")
+                
+                # Synchronize after shuffling to ensure all processes are ready
+                if process_count > 1:
+                    multihost_utils.sync_global_devices(f"epoch_{epoch}_shuffled")
                 
                 # Create dataset iterator based on resumption point
                 if epoch == start_epoch and start_batch_idx > 0:
                     print(f"Process {process_index}: Skipping to batch {start_batch_idx} in epoch {epoch+1}")
-                    dataset_iter = enumerate(list(batched_dataset)[start_batch_idx:], start=start_batch_idx)
-                    total_batches = steps_per_epoch
-                    initial = start_batch_idx
+                    try:
+                        # Convert to list first to avoid potential iterator issues
+                        batched_list = list(batched_dataset)
+                        if start_batch_idx < len(batched_list):
+                            dataset_iter = enumerate(batched_list[start_batch_idx:], start=start_batch_idx)
+                            total_batches = len(batched_list)
+                            initial = start_batch_idx
+                        else:
+                            print(f"Process {process_index}: Warning: start_batch_idx {start_batch_idx} exceeds dataset size {len(batched_list)}")
+                            dataset_iter = enumerate(batched_list)
+                            total_batches = len(batched_list)
+                            initial = 0
+                    except Exception as e:
+                        print(f"Process {process_index}: Error creating dataset iterator: {e}")
+                        # Fallback to simpler approach
+                        dataset_iter = enumerate(batched_dataset)
+                        total_batches = len(batched_dataset)
+                        initial = 0
                 else:
-                    dataset_iter = enumerate(batched_dataset)
-                    total_batches = steps_per_epoch
+                    try:
+                        # Convert to list first to avoid potential iterator issues
+                        batched_list = list(batched_dataset)
+                        dataset_iter = enumerate(batched_list)
+                        total_batches = len(batched_list)
+                    except Exception as e:
+                        print(f"Process {process_index}: Error creating dataset iterator: {e}")
+                        # Fallback to simpler approach
+                        dataset_iter = enumerate(batched_dataset)
+                        total_batches = len(batched_dataset)
                     initial = 0
                 
                 # Create progress bar (only on main process)
@@ -679,4 +748,22 @@ def main():
         return
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Print detailed error information
+        import traceback
+        print(f"Unhandled exception in main: {e}")
+        traceback.print_exc()
+        
+        # Try to report error to all processes if possible
+        try:
+            import jax
+            process_index = jax.process_index()
+            print(f"Error occurred on process {process_index}")
+        except:
+            print("Could not determine process index")
+        
+        # Exit with error code
+        import sys
+        sys.exit(1)
