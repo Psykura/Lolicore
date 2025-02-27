@@ -72,7 +72,10 @@ def initialize_jax_distributed():
     process_index = jax.process_index()
     process_count = jax.process_count()
     
-    print(f"Process {process_index} of {process_count} initialized")
+    # Get local device count
+    local_device_count = jax.local_device_count()
+    
+    print(f"Process {process_index} of {process_count} initialized with {local_device_count} local devices")
     
     # Ensure all processes have initialized before proceeding
     # This helps synchronize all hosts
@@ -84,8 +87,16 @@ def initialize_jax_distributed():
         
         # Use JAX's collective operations to synchronize all processes
         # This ensures all processes are at the same point before continuing
-        x = jnp.ones([1])
-        jax.pmap(lambda x: jax.lax.psum(x, 'i'), axis_name='i')(x)
+        # Create an array with shape matching the number of local devices
+        x = jnp.ones((local_device_count,))
+        
+        # Define a simple pmap function for synchronization
+        @jax.pmap
+        def sync_hosts(x):
+            return jax.lax.psum(x, 'i')
+        
+        # Execute the pmap function
+        sync_hosts(x)
         
         print(f"Process {process_index} synchronized with all other processes")
     
