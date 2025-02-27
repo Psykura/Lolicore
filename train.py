@@ -127,19 +127,26 @@ def create_train_state(
     }
 
     # Initialize model on CPU explicitly
-    with jax.devices("cpu")[0]:
-        # Create dummy inputs on CPU
-        cpu_dummy_input = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
-        cpu_dummy_mask = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
-        
-        print("Initializing model on CPU...")
-        # Initialize on CPU
+    print("Initializing model on CPU...")
+    # Create dummy inputs on CPU
+    cpu_dummy_input = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
+    cpu_dummy_mask = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
+    
+    # Get CPU device
+    cpu_device = jax.devices("cpu")[0]
+    
+    # Initialize on CPU using explicit device_put
+    cpu_dummy_input = jax.device_put(cpu_dummy_input, cpu_device)
+    cpu_dummy_mask = jax.device_put(cpu_dummy_mask, cpu_device)
+    
+    # Initialize with explicit CPU placement
+    with jax.default_device(cpu_device):
         cpu_variables = model.init(
             rngs,
             cpu_dummy_input,
             cpu_dummy_mask,
         )
-        print("CPU initialization complete")
+    print("CPU initialization complete")
 
     # Create optimizer
     optimizer = optax.chain(
