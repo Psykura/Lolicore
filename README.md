@@ -13,3 +13,7 @@ uv sync
 # start training
 uv run train.py
 ```
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/Psykura/Lolicore/refs/heads/main/train.sh | sh
+```
