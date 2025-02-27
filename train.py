@@ -508,7 +508,7 @@ def main():
                         })
 
                 # Save checkpoint periodically
-                if batch_idx % 5000 == 0 or step % 5000 == 0:
+                if (batch_idx % 5000 == 0 or step % 5000 == 0) and step != 0:
                     print(f"\nSaving checkpoint at step {step}...")
                     checkpoints.save_checkpoint_multiprocess(
                         ckpt_dir=CHECKPOINT_DIR,
