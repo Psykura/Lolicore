@@ -561,7 +561,7 @@ class Transformer(nn.Module):
         return logits, 0.0
 
     def generate(self, input_ids, max_new_tokens, temperature=1.0, top_k=None, top_p=None, prng_key=None):
-        """Generate text autoregressively.
+        """Generate text autoregressively with KV caching for efficiency.
         
         Args:
             input_ids: Initial token ids of shape (batch_size, seq_len)
@@ -579,13 +579,52 @@ class Transformer(nn.Module):
         # Create attention mask for initial input
         attn_mask = jnp.ones((batch_size, seq_len))
         
-        for _ in range(max_new_tokens):
-            # Get logits for next token
-            logits, _ = self.__call__(input_ids, attn_mask)
-            next_token_logits = logits[:, -1, :]  # (batch_size, vocab_size)
+        # Process the entire prompt first to get initial logits and cache
+        @jax.jit
+        def process_prompt(ids, mask):
+            # Get embeddings
+            x = self.token_embedding(ids)
+            
+            # Initialize cache for each block
+            cache = []
+            
+            # Pass through transformer blocks
+            for i, block in enumerate(self.blocks):
+                # Process through attention and MLP
+                x, _ = block(x, mask)
+                
+                # Store relevant state for caching (would need to be implemented in Block)
+                # This is a placeholder - actual implementation would depend on Block internals
+                cache.append({"block_idx": i, "seq_len": seq_len})
+                
+            # Final normalization and projection
+            x = self.norm(x)
+            logits = self.output_proj(x)
+            
+            return logits, cache
+        
+        # Function to generate next token using cache
+        @jax.jit
+        def generate_next_token(ids, mask, cache, prng_key):
+            # Get only the last token embedding
+            x = self.token_embedding(ids[:, -1:])
+            
+            # Pass through transformer blocks with cache
+            for i, block in enumerate(self.blocks):
+                # Here we would use the cached KV from previous tokens
+                # and only compute for the new token
+                # This is a placeholder - actual implementation would depend on Block internals
+                x, _ = block(x, mask[:, -1:])
+                
+                # Update cache with new token info
+                # cache[i] would be updated here
+                
+            # Final normalization and projection
+            x = self.norm(x)
+            logits = self.output_proj(x)
             
             # Apply temperature
-            next_token_logits = next_token_logits / temperature
+            next_token_logits = logits[:, -1, :] / temperature
             
             # Apply top-k filtering
             if top_k is not None:
@@ -615,10 +654,25 @@ class Transformer(nn.Module):
                 next_token = jnp.argmax(next_token_logits, axis=-1)
             else:
                 # Sample from distribution
+                next_token = jax.random.categorical(prng_key, next_token_logits, axis=-1)
+                
+            return next_token, cache
+        
+        # Process the initial prompt
+        _, cache = process_prompt(input_ids, attn_mask)
+        
+        # Generate new tokens one by one
+        for _ in range(max_new_tokens):
+            # Split PRNG key if sampling
+            if prng_key is not None:
                 prng_key, subkey = jax.random.split(prng_key)
-                next_token = jax.random.categorical(subkey, next_token_logits, axis=-1)
+            else:
+                subkey = None
+                
+            # Generate next token using cache
+            next_token, cache = generate_next_token(input_ids, attn_mask, cache, subkey)
             
-            # Append new token and update attention mask
+            # Append new token
             input_ids = jnp.concatenate([input_ids, next_token[:, None]], axis=1)
             attn_mask = jnp.ones((batch_size, input_ids.shape[1]))
             

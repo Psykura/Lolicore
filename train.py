@@ -23,7 +23,7 @@ from jax.experimental.multihost_utils import sync_global_devices
 
 # Constants
 CONTEXT_LENGTH = 1024
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 NUM_EPOCHS = 5
 LEARNING_RATE = 1e-4
 WARMUP_STEPS = 100
@@ -95,6 +95,7 @@ def create_learning_rate_schedule(
 def create_train_state(
     rng: jax.random.PRNGKey,
     mesh: Mesh,
+    learning_rate_fn: optax.Schedule,
     **kwargs
 ) -> train_state.TrainState:
     """Creates initial `TrainState`."""
@@ -125,40 +126,50 @@ def create_train_state(
         'noise': noise_rng
     }
 
-    # Initialize model
-    dummy_input = jnp.ones((2, CONTEXT_LENGTH), dtype=jnp.int32)
-    dummy_mask = jnp.ones((2, CONTEXT_LENGTH), dtype=jnp.int32)
-
-    variables = model.init(
-        rngs,
-        dummy_input,
-        dummy_mask,
-    )
+    # Initialize model on CPU explicitly
+    with jax.devices("cpu")[0]:
+        # Create dummy inputs on CPU
+        cpu_dummy_input = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
+        cpu_dummy_mask = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
+        
+        print("Initializing model on CPU...")
+        # Initialize on CPU
+        cpu_variables = model.init(
+            rngs,
+            cpu_dummy_input,
+            cpu_dummy_mask,
+        )
+        print("CPU initialization complete")
 
     # Create optimizer
     optimizer = optax.chain(
         optax.clip_by_global_norm(GRADIENT_CLIP_NORM),
         optax.adamw(
-            learning_rate=kwargs['learning_rate_fn'],
+            learning_rate=learning_rate_fn,
             b1=0.9,
             b2=0.999,
             eps=1e-8,
-            weight_decay=0.01,
+            weight_decay=0.001,
             mu_dtype=DTYPE,
         )
     )
 
     with mesh:
+        print("Transferring parameters to mesh...")
         # Create parameter shardings
         param_shardings = jax.tree.map_with_path(
             lambda path, p: NamedSharding(mesh, get_param_spec(p, path)),
-            variables['params']
+            cpu_variables['params']
         )
 
-        # Initialize with shardings directly
+        # Transfer CPU parameters to mesh with appropriate sharding
+        sharded_params = jax.device_put(cpu_variables['params'], param_shardings)
+        print("Parameter transfer complete")
+        
+        # Initialize state with sharded parameters
         state = train_state.TrainState.create(
             apply_fn=model.apply,
-            params=jax.device_put(variables['params'], param_shardings),
+            params=sharded_params,
             tx=optimizer
         )
 
@@ -224,7 +235,8 @@ def prepare_dataset(tokenizer):
 @jax.jit
 def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rngs: jax.random.PRNGKey):
     """Perform a single training step with model and data parallelism."""
-    rngs, noise_rng = jax.random.split(rngs)
+    #rngs, noise_rng = jax.random.split(rngs)
+    noise_rng = rngs
 
     def stable_cross_entropy(logits, labels):
         # Compute max for numerical stability
@@ -372,7 +384,7 @@ def main():
             base_learning_rate=LEARNING_RATE
         )
         # Initialize model and state
-        rng = jax.random.PRNGKey(0)
+        rng = jax.random.key(0)
         rng, init_rng = jax.random.split(rng)
 
         # Check for existing checkpoints
@@ -421,10 +433,6 @@ def main():
 
         # Pre-batch the dataset
         batched_dataset = train_dataset.batch(samples_per_step, num_proc=16)
-
-        # Training loop
-        train_metrics = []
-
         # Calculate starting epoch and batch index based on loaded step
         start_epoch = step // steps_per_epoch
         start_batch_idx = step % steps_per_epoch
@@ -468,7 +476,6 @@ def main():
 
                 # Train step with sharding
                 state, metrics = train_step(state, batch, rngs=rng)
-                train_metrics.append(metrics)
 
                 if batch_idx % 50 == 0:
                     # Convert JAX arrays to float values for formatting

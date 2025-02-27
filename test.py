@@ -6,6 +6,7 @@ from flax.training import checkpoints
 import os
 import numpy as np
 from flax.training import orbax_utils
+import time
 
 CONTEXT_LENGTH = 512
 VOCAB_SIZE = 50257
@@ -82,6 +83,21 @@ def load_model():
     
     return model, state
 
+# JIT-compiled text generation function for better performance
+@jax.jit
+def generate_text_jit(model, state, input_ids, attention_mask, max_new_tokens, temperature, top_k, top_p, prng_key):
+    """JIT-compiled version of text generation for better performance."""
+    return model.apply(
+        {'params': state['params']},
+        method=model.generate,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        prng_key=prng_key
+    )
+
 def generate_text(prompt, model, state, tokenizer, 
                  max_new_tokens=100, 
                  temperature=0.8,
@@ -96,26 +112,47 @@ def generate_text(prompt, model, state, tokenizer,
     
     # Create PRNG keys for sampling and noise
     rng = jax.random.PRNGKey(0)
-    rng, sampling_rng, noise_rng = jax.random.split(rng, 3)
+    rng, sampling_rng = jax.random.split(rng)
     
-    # Generate tokens using the generate method
-    output_ids = model.apply(
-        {'params': state['params']},
-        method=model.generate,  # Specify the generate method
-        input_ids=input_ids,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        prng_key=sampling_rng,
-        rngs={'noise': noise_rng}  # Pass noise RNG key
+    # Measure generation time
+    start_time = time.time()
+    
+    # Generate tokens using the JIT-compiled function
+    output_ids = generate_text_jit(
+        model, 
+        state, 
+        input_ids, 
+        attention_mask, 
+        max_new_tokens, 
+        temperature, 
+        top_k, 
+        top_p, 
+        sampling_rng
     )
+    
+    # Calculate generation time and tokens per second
+    end_time = time.time()
+    generation_time = end_time - start_time
+    tokens_generated = output_ids.shape[1] - input_ids.shape[1]
+    tokens_per_second = tokens_generated / generation_time
+    
+    print(f"Generated {tokens_generated} tokens in {generation_time:.2f} seconds")
+    print(f"Speed: {tokens_per_second:.2f} tokens/second")
     
     # Decode the generated tokens
     generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=True)
     return generated_text
 
 def main():
+    # Try to enable GPU if available
+    try:
+        # Print available devices
+        print(f"Available JAX devices: {jax.devices()}")
+        print(f"JAX process index: {jax.process_index()}")
+        print(f"JAX device count: {jax.device_count()}")
+    except Exception as e:
+        print(f"Error checking JAX devices: {e}")
+    
     # Load the tokenizer
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained('gpt2')
@@ -124,8 +161,17 @@ def main():
     print("Loading model...")
     model, state = load_model()
     
+    # Compile the model once with a dummy input to warm up JAX
+    print("Warming up JAX compilation...")
+    dummy_input = jnp.ones((1, 10), dtype=jnp.int32)
+    dummy_mask = jnp.ones_like(dummy_input)
+    dummy_rng = jax.random.PRNGKey(0)
+    _ = generate_text_jit(model, state, dummy_input, dummy_mask, 1, 0.8, 50, 0.9, dummy_rng)
+    print("JAX compilation completed")
+    
     # Example prompts to test
     prompts = [
+        "Why the ocean is salty? The Ocean is salty because",
         "Once upon a time",
         "The future of artificial intelligence",
         "In a world where technology",
