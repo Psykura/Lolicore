@@ -358,7 +358,10 @@ def create_mesh():
     return mesh, n_devices
 
 def main():
-    # if jax_smi is installed, track GPU memory usage
+    # Prepare datasets - now returns both batched dataset and original dataset size
+    batched_dataset, dataset_size = prepare_dataset(tokenizer)
+
+    # if jax_smi is installed, track memory usage
     import sys
     if 'jax_smi' in sys.modules:
         from jax_smi import initialise_tracking
@@ -384,9 +387,6 @@ def main():
 
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True, cache_dir='./cache')
-
-    # Prepare datasets - now returns both batched dataset and original dataset size
-    batched_dataset, dataset_size = prepare_dataset(tokenizer)
 
     print(f"Syncing start state for process {jax.process_index()}")
     sync_global_devices('train')
