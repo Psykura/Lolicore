@@ -58,7 +58,6 @@ DATASET_CONFIG = {
     'path': 'HuggingFaceFW/fineweb',
     'name': 'sample-350BT',
     'split': 'train',
-    'cache_dir': './cache',
 }
 
 def create_learning_rate_schedule(
