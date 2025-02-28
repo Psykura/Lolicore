@@ -358,6 +358,9 @@ def create_mesh():
     return mesh, n_devices
 
 def main():
+    # Initialize tokenizer
+    tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True, cache_dir='./cache')
+
     # Prepare datasets - now returns both batched dataset and original dataset size
     batched_dataset, dataset_size = prepare_dataset(tokenizer)
 
@@ -384,9 +387,6 @@ def main():
                 "dtype": str(DTYPE),
             }
         )
-
-    # Initialize tokenizer
-    tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True, cache_dir='./cache')
 
     print(f"Syncing start state for process {jax.process_index()}")
     sync_global_devices('train')
