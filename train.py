@@ -22,12 +22,13 @@ from jax.experimental.multihost_utils import sync_global_devices
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
 
 # Constants
-CONTEXT_LENGTH = 1024
+CONTEXT_LENGTH = 2048
 BATCH_SIZE = 32
 NUM_EPOCHS = 5
 LEARNING_RATE = 1e-4
 WARMUP_STEPS = 100
 GRADIENT_CLIP_NORM = 1.0
+BATCH_MESH_SIZE = 2
 DTYPE = jnp.bfloat16  # Set default dtype to bfloat16
 
 vocab_size = 50257
@@ -53,8 +54,8 @@ MODEL_CONFIG = {
 
 # Dataset configuration
 DATASET_CONFIG = {
-    'path': 'wikitext',
-    'name': 'wikitext-103-v1',
+    'path': 'HuggingFaceFW/fineweb',
+    'name': 'sample-350BT',
     'split': 'train',
     'cache_dir': './cache',
 }
@@ -246,11 +247,18 @@ def prepare_dataset(tokenizer):
 
     print(f"Processed dataset size: {len(tokenized_dataset)}")
 
-    # Save tokenized dataset to disk
-    tokenized_dataset.save_to_disk('tokenized_dataset')
-    print("Tokenized dataset saved to disk")
-
-    return tokenized_dataset
+    # Calculate batch size for dataset
+    samples_per_step = BATCH_SIZE * BATCH_MESH_SIZE
+    
+    # Batch the dataset
+    print(f"Batching dataset with {samples_per_step} samples per batch...")
+    batched_dataset = tokenized_dataset.batch(samples_per_step, drop_last_batch=True, num_proc=16)
+    
+    # Save batched dataset to disk
+    batched_dataset.save_to_disk('batched_dataset')
+    print(f"Batched dataset saved to disk with {len(batched_dataset)} batches")
+    
+    return batched_dataset, len(tokenized_dataset)
 
 @jax.jit
 def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rngs: jax.random.PRNGKey):
@@ -344,7 +352,7 @@ def create_mesh():
     devices = jax.devices()
     n_devices = len(devices)
 
-    mesh_shape = (n_devices // 2, 2) 
+    mesh_shape = (n_devices // BATCH_MESH_SIZE, BATCH_MESH_SIZE) 
 
     mesh = jax.make_mesh(mesh_shape, ('model', 'batch'))
     return mesh, n_devices
@@ -377,8 +385,8 @@ def main():
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True, cache_dir='./cache')
 
-    # Prepare datasets
-    train_dataset = prepare_dataset(tokenizer)
+    # Prepare datasets - now returns both batched dataset and original dataset size
+    batched_dataset, dataset_size = prepare_dataset(tokenizer)
 
     print(f"Syncing start state for process {jax.process_index()}")
     sync_global_devices('train')
@@ -391,16 +399,16 @@ def main():
     sync_global_devices('mesh_created')
 
     # Calculate steps per epoch and total steps
-    samples_per_step = BATCH_SIZE * 4  # 4 data shards
-    steps_per_epoch = len(train_dataset) // samples_per_step
+    steps_per_epoch = len(batched_dataset)  # Now this is just the number of batches
     total_steps = steps_per_epoch * NUM_EPOCHS
 
-    print(f"Dataset size: {len(train_dataset)}")
+    print(f"Original dataset size: {dataset_size}")
+    print(f"Number of batches: {len(batched_dataset)}")
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Total steps: {total_steps}")
 
     with mesh:
-            # Create learning rate schedule
+        # Create learning rate schedule
         learning_rate_fn = create_learning_rate_schedule(
             num_train_steps=total_steps,
             warmup_steps=WARMUP_STEPS,
@@ -454,8 +462,6 @@ def main():
         if jax.process_index() == 0:
             wandb.run.summary["model_parameters_B"] = param_count/1e9
 
-        # Pre-batch the dataset
-        batched_dataset = train_dataset.batch(samples_per_step, drop_last_batch=True, num_proc=16)
         # Calculate starting epoch and batch index based on loaded step
         start_epoch = step // steps_per_epoch
         start_batch_idx = step % steps_per_epoch
