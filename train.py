@@ -37,15 +37,15 @@ vocab_size = ((vocab_size + 127) // 128) * 128
 MODEL_CONFIG = {
     'num_blocks': 12,
     'num_heads': 8,
-    'd_model': 512,
-    'hidden_size': 2048,
+    'd_model': 768,
+    'hidden_size': 4096,
     'max_seq_length': CONTEXT_LENGTH,
     'vocab_size': vocab_size,  # GPT-2 vocab size
     'num_experts': 24,
     'num_shared_experts': 1,
     'top_k': 4,
     'use_gradient_checkpointing': True,
-    'attention_latent_dim': 32,
+    'attention_latent_dim': 64,
     'num_zeros_experts': 1,
     'num_constant_experts': 3,
     'num_noise_experts': 1,
