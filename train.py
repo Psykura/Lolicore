@@ -30,6 +30,7 @@ WARMUP_STEPS = 100
 GRADIENT_CLIP_NORM = 1.0
 BATCH_MESH_SIZE = 2
 DTYPE = jnp.bfloat16  # Set default dtype to bfloat16
+PARALLEL_PROCESSING = 16
 
 vocab_size = 50257
 vocab_size = ((vocab_size + 127) // 128) * 128
@@ -189,7 +190,7 @@ def prepare_dataset(tokenizer):
         tokenized_dataset = load_from_disk('tokenized_dataset')
         return tokenized_dataset
 
-    dataset = load_dataset(**DATASET_CONFIG)
+    dataset = load_dataset(**DATASET_CONFIG, cache_dir='./cache', num_proc=PARALLEL_PROCESSING)
     print(f"Raw dataset size: {len(dataset)}")
 
     def tokenize_and_chunk(examples):
@@ -242,7 +243,7 @@ def prepare_dataset(tokenizer):
         tokenize_and_chunk,
         remove_columns=dataset.column_names,
         batched=True,
-        num_proc=16,
+        num_proc=PARALLEL_PROCESSING,
     )
 
     print(f"Processed dataset size: {len(tokenized_dataset)}")
@@ -252,7 +253,7 @@ def prepare_dataset(tokenizer):
     
     # Batch the dataset
     print(f"Batching dataset with {samples_per_step} samples per batch...")
-    batched_dataset = tokenized_dataset.batch(samples_per_step, drop_last_batch=True, num_proc=16)
+    batched_dataset = tokenized_dataset.batch(samples_per_step, drop_last_batch=True, num_proc=PARALLEL_PROCESSING)
     
     # Save batched dataset to disk
     batched_dataset.save_to_disk('batched_dataset')
