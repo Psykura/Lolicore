@@ -194,8 +194,7 @@ def prepare_dataset(tokenizer):
     def tokenize_and_chunk(examples):
         tokenized = tokenizer(
             examples['text'],
-            truncation=True,
-            max_length=CONTEXT_LENGTH,
+            truncation=False,
             add_special_tokens=True
         )
 
@@ -208,14 +207,28 @@ def prepare_dataset(tokenizer):
             if len(input_ids) < 32 or not any(input_ids):  # Skip very short or empty sequences
                 continue
 
-            # Pad or truncate to CONTEXT_LENGTH
-            if len(input_ids) > CONTEXT_LENGTH:
-                input_ids = input_ids[:CONTEXT_LENGTH]
-            else:
-                input_ids = input_ids + [tokenizer.eos_token_id] * (CONTEXT_LENGTH - len(input_ids))
-
-            chunks.append(input_ids)
-            attention_masks.append([1] * CONTEXT_LENGTH)
+            # Split into chunks of context_length
+            for i in range(0, len(input_ids) + CONTEXT_LENGTH, CONTEXT_LENGTH):
+                chunk = input_ids[i:i + CONTEXT_LENGTH]
+                
+                # Only process chunks that are reasonably sized
+                if len(chunk) < 32:
+                    continue
+                    
+                # Pad the last chunk if needed
+                if len(chunk) < CONTEXT_LENGTH:
+                    # Calculate padding length
+                    padding_length = CONTEXT_LENGTH - len(chunk)
+                    # Pad the chunk with EOS tokens
+                    chunk = chunk + [tokenizer.eos_token_id] * padding_length
+                    # Create attention mask with 1s for real tokens and 0s for padding
+                    attention_mask = [1] * len(chunk) + [0] * padding_length
+                else:
+                    # No padding needed, attention mask is all 1s
+                    attention_mask = [1] * CONTEXT_LENGTH
+                
+                chunks.append(chunk)
+                attention_masks.append(attention_mask)
 
         return {
             'input_ids': chunks,
@@ -337,8 +350,11 @@ def create_mesh():
     return mesh, n_devices
 
 def main():
-    from jax_smi import initialise_tracking
-    initialise_tracking()
+    # if jax_smi is installed, track GPU memory usage
+    import sys
+    if 'jax_smi' in sys.modules:
+        from jax_smi import initialise_tracking
+        initialise_tracking()
 
     CHECKPOINT_DIR = os.path.abspath("./checkpoints")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -439,7 +455,7 @@ def main():
             wandb.run.summary["model_parameters_B"] = param_count/1e9
 
         # Pre-batch the dataset
-        batched_dataset = train_dataset.batch(samples_per_step, num_proc=16)
+        batched_dataset = train_dataset.batch(samples_per_step, drop_last_batch=True, num_proc=16)
         # Calculate starting epoch and batch index based on loaded step
         start_epoch = step // steps_per_epoch
         start_batch_idx = step % steps_per_epoch
