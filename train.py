@@ -174,7 +174,7 @@ def create_train_state(
 def prepare_dataset(tokenizer):
     """Prepare dataset with tokenization and chunking."""
     if os.path.exists(TOKENIZED_DATASET_PATH):
-        tokenized_dataset = load_from_disk(TOKENIZED_DATASET_PATH, keep_in_memory=True)
+        tokenized_dataset = load_from_disk(TOKENIZED_DATASET_PATH)
         print(f"Loaded tokenized dataset from disk with {len(tokenized_dataset)} examples")
         samples_per_step = BATCH_SIZE * BATCH_MESH_SIZE
 
