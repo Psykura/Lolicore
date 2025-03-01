@@ -31,6 +31,7 @@ GRADIENT_CLIP_NORM = 1.0
 BATCH_MESH_SIZE = 2
 DTYPE = jnp.bfloat16  # Set default dtype to bfloat16
 PARALLEL_PROCESSING = 16
+TOKENIZED_DATASET_PATH = '/mnt/dataset/tokenized_dataset'
 
 vocab_size = 50257
 vocab_size = ((vocab_size + 127) // 128) * 128
@@ -171,8 +172,8 @@ def create_train_state(
 
 def prepare_dataset(tokenizer):
     """Prepare dataset with tokenization and chunking."""
-    if os.path.exists('tokenized_dataset'):
-        tokenized_dataset = load_from_disk('tokenized_dataset')
+    if os.path.exists(TOKENIZED_DATASET_PATH):
+        tokenized_dataset = load_from_disk(TOKENIZED_DATASET_PATH)
         print(f"Loaded tokenized dataset from disk with {len(tokenized_dataset)} examples")
         samples_per_step = BATCH_SIZE * BATCH_MESH_SIZE
         batched_dataset = tokenized_dataset.batch(samples_per_step, drop_last_batch=True, num_proc=PARALLEL_PROCESSING)
@@ -237,7 +238,7 @@ def prepare_dataset(tokenizer):
 
     print(f"Processed dataset size: {len(tokenized_dataset)}")
 
-    tokenized_dataset.save_to_disk('tokenized_dataset')
+    tokenized_dataset.save_to_disk(TOKENIZED_DATASET_PATH)
 
     # Calculate batch size for dataset
     samples_per_step = BATCH_SIZE * BATCH_MESH_SIZE
