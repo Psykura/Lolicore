@@ -189,7 +189,7 @@ def prepare_dataset(tokenizer):
         tokenized_dataset = load_from_disk('tokenized_dataset')
         return tokenized_dataset
 
-    dataset = load_dataset(**DATASET_CONFIG, cache_dir='./cache', num_proc=PARALLEL_PROCESSING)
+    dataset = load_dataset(**DATASET_CONFIG, num_proc=PARALLEL_PROCESSING)
     print(f"Raw dataset size: {len(dataset)}")
 
     def tokenize_and_chunk(examples):
@@ -359,7 +359,7 @@ def create_mesh():
 
 def main():
     # Initialize tokenizer
-    tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True, cache_dir='./cache')
+    tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True)
 
     # Prepare datasets - now returns both batched dataset and original dataset size
     batched_dataset, dataset_size = prepare_dataset(tokenizer)
@@ -370,7 +370,7 @@ def main():
         from jax_smi import initialise_tracking
         initialise_tracking()
 
-    CHECKPOINT_DIR = os.path.abspath("./checkpoints")
+    CHECKPOINT_DIR = os.path.join(os.path.expanduser("~"), "checkpoints")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
     if jax.process_index() == 0:
