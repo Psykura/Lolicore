@@ -17,7 +17,8 @@ from tqdm import tqdm
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 import wandb
 from jax.experimental.multihost_utils import sync_global_devices
-
+from datasets import set_caching_enabled
+set_caching_enabled(False)
 # This script trains a Transformer model with MoE (Mixture of Experts) architecture
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
 
@@ -175,7 +176,7 @@ def create_train_state(
 def prepare_dataset(tokenizer):
     """Prepare dataset with tokenization and chunking."""
     if os.path.exists(TOKENIZED_DATASET_PATH):
-        tokenized_dataset = load_from_disk(TOKENIZED_DATASET_PATH)
+        tokenized_dataset = load_from_disk(TOKENIZED_DATASET_PATH, keep_in_memory=True)
         print(f"Loaded tokenized dataset from disk with {len(tokenized_dataset)} examples")
         samples_per_step = BATCH_SIZE * BATCH_MESH_SIZE
 
