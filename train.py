@@ -187,7 +187,10 @@ def prepare_dataset(tokenizer):
     """Prepare dataset with tokenization and chunking."""
     if os.path.exists('tokenized_dataset'):
         tokenized_dataset = load_from_disk('tokenized_dataset')
-        return tokenized_dataset
+        print(f"Loaded tokenized dataset from disk with {len(tokenized_dataset)} examples")
+        samples_per_step = BATCH_SIZE * BATCH_MESH_SIZE
+        batched_dataset = tokenized_dataset.batch(samples_per_step, drop_last_batch=True, num_proc=PARALLEL_PROCESSING)
+        return batched_dataset, len(tokenized_dataset)
 
     dataset = load_dataset(**DATASET_CONFIG, num_proc=PARALLEL_PROCESSING)
     print(f"Raw dataset size: {len(dataset)}")
@@ -237,15 +240,18 @@ def prepare_dataset(tokenizer):
             'labels': chunks  # For causal language modeling
         }
 
-    # Use sequential processing
+    # Use sequential processing without caching
     tokenized_dataset = dataset.map(
         tokenize_and_chunk,
         remove_columns=dataset.column_names,
         batched=True,
         num_proc=PARALLEL_PROCESSING,
+        cache_file_name=None  # Disable caching
     )
 
     print(f"Processed dataset size: {len(tokenized_dataset)}")
+
+    tokenized_dataset.save_to_disk('tokenized_dataset')
 
     # Calculate batch size for dataset
     samples_per_step = BATCH_SIZE * BATCH_MESH_SIZE
@@ -255,7 +261,6 @@ def prepare_dataset(tokenizer):
     batched_dataset = tokenized_dataset.batch(samples_per_step, drop_last_batch=True, num_proc=PARALLEL_PROCESSING)
     
     # Save batched dataset to disk
-    batched_dataset.save_to_disk('batched_dataset')
     print(f"Batched dataset saved to disk with {len(batched_dataset)} batches")
     
     return batched_dataset, len(tokenized_dataset)
