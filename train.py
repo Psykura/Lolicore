@@ -17,8 +17,6 @@ from tqdm import tqdm
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 import wandb
 from jax.experimental.multihost_utils import sync_global_devices
-from datasets import set_caching_enabled
-set_caching_enabled(False)
 # This script trains a Transformer model with MoE (Mixture of Experts) architecture
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
 
@@ -187,7 +185,9 @@ def prepare_dataset(tokenizer):
             drop_last_batch=True,
             num_proc=PARALLEL_PROCESSING,
             desc="Batching examples",
-            cache_file_name=None
+            cache_file_name=None,
+            load_from_cache_file=False,
+            keep_in_memory=True
         )
 
         return batched_dataset, len(tokenized_dataset)
