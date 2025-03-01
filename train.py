@@ -45,7 +45,6 @@ MODEL_CONFIG = {
     'vocab_size': vocab_size,  # GPT-2 vocab size
     'num_experts': 24,
     'num_shared_experts': 1,
-    'top_k': 4,
     'use_gradient_checkpointing': True,
     'attention_latent_dim': 64,
     'num_zeros_experts': 1,
@@ -101,22 +100,9 @@ def create_train_state(
 ) -> train_state.TrainState:
     """Creates initial `TrainState`."""
     model = Transformer(
-        num_blocks=kwargs['num_blocks'],
-        num_heads=kwargs['num_heads'],
-        d_model=kwargs['d_model'],
-        hidden_size=kwargs['hidden_size'],
-        max_seq_length=kwargs['max_seq_length'],
-        vocab_size=kwargs['vocab_size'],
-        attention_latent_dim=kwargs['attention_latent_dim'],
-        num_experts=kwargs['num_experts'],
-        num_shared_experts=kwargs['num_shared_experts'],
-        num_zeros_experts=kwargs['num_zeros_experts'],
-        num_constant_experts=kwargs['num_constant_experts'],
-        num_noise_experts=kwargs['num_noise_experts'],
-        top_k=kwargs['top_k'],
         dtype=DTYPE,
-        use_gradient_checkpointing=kwargs['use_gradient_checkpointing'],
-        training=True
+        training=True,
+        **kwargs
     )
 
     # Initialize model

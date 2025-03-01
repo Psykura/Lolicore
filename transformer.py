@@ -196,9 +196,9 @@ class FeedForward(nn.Module):
         return x
 
 class Router(nn.Module):
+    """Router module for Mixture of Experts that computes token-to-expert assignments."""
     d_model: int
     num_experts: int
-    top_k: int = 0
     z_loss_coef: float = 1e-3
     balance_loss_coef: float = 1e-2
     dtype: jnp.dtype = jnp.bfloat16
@@ -206,61 +206,94 @@ class Router(nn.Module):
     use_gradient_checkpointing: bool = False
 
     def setup(self):
+        # Gate network that produces logits for expert assignment
+        gate_init = nn.initializers.lecun_normal()
         self.gate = nn.Dense(
             features=self.num_experts,
             use_bias=False,
-            kernel_init=nn.initializers.lecun_normal(),
+            kernel_init=gate_init,
             dtype=self.dtype
         )
 
-    def __call__(self, x):
-        # x shape: (batch_size, seq_len, d_model)
+    def __call__(self, x, expert_capacity: int, use_mask_routing: bool = False):
+        """Route tokens to experts based on learned assignment.
         
-        # Compute router logits
-        router_logits = self.gate(x)
-        # router_logits shape: (batch_size, seq_len, num_experts)
+        Args:
+            x: Input tensor of shape (num_groups, group_size, d_model)
+            expert_capacity: Maximum number of tokens per expert
+            
+        Returns:
+            If training:
+                expert_masks: Tensor of shape (num_experts, num_groups, group_size) containing binary masks
+                weight_masks: Tensor of shape (num_experts, num_groups, group_size) containing routing weights
+                loss: Combined router loss (balance + z-loss)
+            Else:
+                indices: Tensor of shape (num_experts, expert_capacity, 2) containing (group, position) indices
+                weights: Tensor of shape (num_experts, expert_capacity) containing routing weights
+                loss: Combined router loss (balance + z-loss)
+        """
+        num_groups, group_size, _ = x.shape
+        total_tokens = num_groups * group_size
         
-        # Get routing weights and indices
-        if self.top_k > 0:
-            indices, weights = self._top_k_routing(router_logits)
-            # indices shape: (batch_size, seq_len, top_k)
-            # weights shape: (batch_size, seq_len, top_k)
+        # Compute routing probabilities
+        router_logits = self.gate(x)  # (num_groups, group_size, num_experts)
+        router_probs = jax.nn.softmax(router_logits, axis=-1)
+        
+        if self.training:
+            # Calculate load balancing loss
+            # Ideal: uniform distribution across experts
+            expert_usage = jnp.sum(router_probs, axis=(0, 1)) / total_tokens
+            balance_loss = (self.num_experts * jnp.sum(expert_usage ** 2) - 1.0) * self.balance_loss_coef
+            
+            # Calculate router z-loss to stabilize routing probabilities
+            # Penalizes large values in the routing logits
+            router_z = jnp.log(jnp.sum(jnp.exp(router_logits), axis=-1))
+            router_z_loss = jnp.mean(jnp.square(router_z)) * self.z_loss_coef
+            
+            # Combined loss
+            loss = balance_loss + router_z_loss
         else:
-            raise ValueError("top_k must be greater than 0")
+            loss = 0.0
         
-        if not self.training:
-            return indices, weights, 0.0
+        # Reshape for expert-wise token selection
+        # (num_experts, num_groups * group_size)
+        flat_probs = router_probs.transpose(2, 0, 1).reshape(self.num_experts, -1)
         
-        # Calculate balance loss
-        expert_mask = jax.nn.one_hot(indices, self.num_experts)
-        expert_usage = expert_mask * weights[..., None]
-        expert_usage = expert_usage.sum(axis=(0, 1))
-        balance_loss = (expert_usage.std() / expert_usage.mean()) * self.balance_loss_coef
-
-        # Calculate router z-loss
-        # sum(exp(logits)) per token, then log, square, and mean
-        router_z_loss = jnp.square(
-            jnp.log(
-                jnp.sum(
-                    jnp.exp(router_logits), 
-                    axis=-1
-                )
-            )
-        ).mean() * self.z_loss_coef
+        # Select top tokens for each expert
+        scores, token_indices = jax.lax.top_k(flat_probs, k=expert_capacity)
         
-        loss = balance_loss + router_z_loss
+        # Convert flat indices to (group, position) coordinates
+        group_indices = token_indices // group_size
+        pos_indices = token_indices % group_size
         
-        return indices, weights, loss
-
-    def _top_k_routing(self, logits):
-        """Optimized path for top-k routing"""
-        # logits shape: (batch_size, seq_len, num_experts)
-        scores, indices = jax.lax.top_k(logits, k=self.top_k)
-        # scores shape: (batch_size, seq_len, top_k) - values of top-k experts
-        # indices shape: (batch_size, seq_len, top_k) - indices of top-k experts
-        routing_weights = jax.nn.softmax(scores, axis=-1)
-        # routing_weights shape: (batch_size, seq_len, top_k) - normalized weights summing to 1
-        return indices, routing_weights
+        if use_mask_routing:
+            # For training, create masks directly from the selected indices
+            # Initialize masks
+            expert_masks = jnp.zeros((self.num_experts, num_groups, group_size), dtype=jnp.bool_)
+            weight_masks = jnp.zeros((self.num_experts, num_groups, group_size), dtype=self.dtype)
+            
+            # Create a list of indices for scatter operations
+            batch_indices = jnp.arange(self.num_experts)[:, None]
+            batch_indices = jnp.broadcast_to(batch_indices, (self.num_experts, expert_capacity))
+            
+            # Flatten for scatter operation
+            flat_batch_indices = batch_indices.reshape(-1)
+            flat_group_indices = group_indices.reshape(-1)
+            flat_pos_indices = pos_indices.reshape(-1)
+            flat_scores = scores.reshape(-1)
+            
+            # Create indices for scatter
+            scatter_indices = jnp.stack([flat_batch_indices, flat_group_indices, flat_pos_indices], axis=1)
+            
+            # Use scatter to update the masks
+            expert_masks = expert_masks.at[scatter_indices[:, 0], scatter_indices[:, 1], scatter_indices[:, 2]].set(True)
+            weight_masks = weight_masks.at[scatter_indices[:, 0], scatter_indices[:, 1], scatter_indices[:, 2]].set(flat_scores)
+            
+            return expert_masks, weight_masks, loss
+        else:
+            # For inference, return indices and weights
+            indices = jnp.stack([group_indices, pos_indices], axis=-1)
+            return indices, scores, loss
 
 class JumpModule(nn.Module):
     """Jump module that can return zeros, trainable constant, or random noise"""
@@ -292,8 +325,11 @@ class ExpertsFeedForward(nn.Module):
     num_zeros_experts: int = 0
     num_constant_experts: int = 0
     num_noise_experts: int = 0
-    top_k: int = 2
+
+    expert_capacity_factor: float = 1.0
+    min_expert_capacity: int = 8
     max_group_size: int = 4096
+
     dtype: jnp.dtype = jnp.bfloat16
     training: bool = False
     use_gradient_checkpointing: bool = False
@@ -304,103 +340,181 @@ class ExpertsFeedForward(nn.Module):
                              - self.num_constant_experts - self.num_noise_experts)
         assert self.num_ff_experts >= 0, "Total special experts exceeds num_experts"
         
+        # Initialize router
         self.router = Router(
             d_model=self.d_model,
             num_experts=self.num_experts,
-            top_k=self.top_k,
             dtype=self.dtype,
             training=self.training,
             use_gradient_checkpointing=self.use_gradient_checkpointing
         )
         
-        # Initialize expert types
-        self.experts = (
-            [FeedForward(hidden_size=self.hidden_size, d_model=self.d_model, dtype=self.dtype, use_gradient_checkpointing=self.use_gradient_checkpointing) for _ in range(self.num_ff_experts)] +
-            [JumpModule(d_model=self.d_model, jump_type='zeros', dtype=self.dtype) for _ in range(self.num_zeros_experts)] +
-            [JumpModule(d_model=self.d_model, jump_type='constant', dtype=self.dtype) for _ in range(self.num_constant_experts)] +
-            [JumpModule(d_model=self.d_model, jump_type='noise', dtype=self.dtype) for _ in range(self.num_noise_experts)]
-        )
-
+        # Initialize different types of experts
+        self.experts = self._create_experts()
+        
         # Shared experts always processed for all tokens
         self.shared_experts = [
-            FeedForward(hidden_size=self.hidden_size, d_model=self.d_model, dtype=self.dtype, use_gradient_checkpointing=self.use_gradient_checkpointing)
-            for _ in range(self.num_shared_experts)
+            FeedForward(
+                hidden_size=self.hidden_size, 
+                d_model=self.d_model, 
+                dtype=self.dtype, 
+                use_gradient_checkpointing=self.use_gradient_checkpointing
+            ) for _ in range(self.num_shared_experts)
         ]
 
-    def __call__(self, x):
-        batch_size, seq_len, _ = x.shape
-
-        # flatten x to (batch_size * seq_len, d_model)
-        x_flat = x.reshape(-1, self.d_model)
-
-        expert_indices, routing_weights, router_loss = self.router(x_flat)
+    def _create_experts(self):
+        """Create the different types of experts."""
+        experts = []
         
-        # Initialize output and process shared experts
-        output = jnp.zeros_like(x_flat)
-        if self.num_shared_experts > 0:
-            shared_output = jnp.zeros_like(output)
-            for expert in self.shared_experts:
-                shared_output += jax.vmap(expert)(x_flat)
-            output += shared_output / len(self.shared_experts)
-
-        # Choose computation path based on training mode
-        if self.training:
-            output += self._compute_training_path(
-                x_flat, expert_indices, routing_weights
-            )
-        else:
-            output += self._compute_inference_path(
-                x_flat, expert_indices, routing_weights
-            )
-
-        # Reshape back to original dimensions
-        final_output = output.reshape(batch_size, seq_len, self.d_model)
-        return final_output, router_loss
-
-    def _compute_training_path(self, x, expert_indices, routing_weights):
-        """Training path processes all experts for gradient flow."""
-        outputs = []
+        # Standard feedforward experts
+        for _ in range(self.num_ff_experts):
+            experts.append(FeedForward(
+                hidden_size=self.hidden_size, 
+                d_model=self.d_model, 
+                dtype=self.dtype, 
+                use_gradient_checkpointing=self.use_gradient_checkpointing
+            ))
         
-        for i, expert in enumerate(self.experts):
-            # Create expert mask and sum weights across top-k dimension
-            expert_mask = (expert_indices == i) * routing_weights
-            expert_mask = expert_mask.sum(axis=-1)
+        # Zero experts (return zeros)
+        for _ in range(self.num_zeros_experts):
+            experts.append(JumpModule(
+                d_model=self.d_model, 
+                jump_type='zeros', 
+                dtype=self.dtype
+            ))
+        
+        # Constant experts (return learned constant)
+        for _ in range(self.num_constant_experts):
+            experts.append(JumpModule(
+                d_model=self.d_model, 
+                jump_type='constant', 
+                dtype=self.dtype
+            ))
+        
+        # Noise experts (return random noise)
+        for _ in range(self.num_noise_experts):
+            experts.append(JumpModule(
+                d_model=self.d_model, 
+                jump_type='noise', 
+                dtype=self.dtype
+            ))
             
-            # Process all tokens through expert and apply weights
-            expert_output = jax.vmap(expert)(x)
-            expert_output = expert_output * expert_mask[..., None]
-            outputs.append(expert_output)
-        
-        return sum(outputs)
+        return experts
 
-    @nn.compact
-    def _compute_inference_path(self, x, expert_indices, routing_weights):
-        # Create branches for all possible expert indices
-        def head_fn(i):
-            return lambda mdl, x: mdl.experts[i](x)
+    def _compute_group_size(self, batch_size, seq_len):
+        """Compute optimal group size for token routing."""
+        num_tokens = batch_size * seq_len
+        min_num_groups = (num_tokens + self.max_group_size - 1) // self.max_group_size
         
-        branches = [head_fn(i) for i in range(self.num_experts)]
+        # Find smallest num_groups that divides num_tokens evenly
+        num_groups = min_num_groups
+        while (num_tokens % num_groups != 0) or (num_groups % self.num_experts != 0):
+            num_groups += 1
+            
+        return num_tokens // num_groups, num_groups
+
+    def _process_shared_experts(self, x):
+        """Process input through shared experts."""
+        if not self.shared_experts:
+            return jnp.zeros_like(x)
+            
+        # Apply all shared experts and average their outputs
+        shared_outputs = [jax.vmap(expert)(x) for expert in self.shared_experts]
+        return jnp.mean(jnp.stack(shared_outputs), axis=0)
+
+    def _process_routed_experts_inference(self, x, expert_indices, routing_weights):
+        """Process tokens through routed experts based on router assignments."""
+        output = jnp.zeros_like(x)
         
-        # Initialize all branches during setup
-        if self.is_mutable_collection('params'):
-            for branch in branches:
-                _ = branch(self, x[0])  # Initialize with first example
+        for expert_idx, expert in enumerate(self.experts):
+            indices_for_expert = expert_indices[expert_idx]
+            weights_for_expert = routing_weights[expert_idx]
+            
+            # Extract tokens for this expert using advanced indexing
+            tokens_for_expert = x[indices_for_expert[:, 0], indices_for_expert[:, 1]]
+            
+            # Process tokens through expert
+            processed_tokens = jax.vmap(expert)(tokens_for_expert)
+            
+            # Scale by routing weights
+            scaled_tokens = processed_tokens * weights_for_expert[:, None]
+            
+            # Use JAX's scatter_add instead of a Python loop
+            output = output.at[indices_for_expert[:, 0], indices_for_expert[:, 1]].add(scaled_tokens)
         
-        outputs = []
-        for i in range(x.shape[0]):  # Batch dimension
-            batch_outputs = []
-            for j in range(self.top_k):
-                expert_output = nn.switch(
-                    expert_indices[i, j],
-                    branches,
-                    self,
-                    x[i]
-                ) * routing_weights[i, j]
-                batch_outputs.append(expert_output)
-                
-            outputs.append(jnp.sum(jnp.stack(batch_outputs), axis=0))
+        return output
+    
+    def _process_routed_experts_training(self, x, expert_masks, weight_masks):
+        """Process tokens through experts during training using pre-computed masks.
         
-        return jnp.stack(outputs)
+        Args:
+            x: Input tensor of shape (num_groups, group_size, d_model)
+            expert_masks: Binary masks of shape (num_experts, num_groups, group_size)
+            weight_masks: Weight masks of shape (num_experts, num_groups, group_size)
+            
+        Returns:
+            Output tensor of shape (num_groups, group_size, d_model)
+        """
+        output = jnp.zeros_like(x)
+        
+        # Process each expert
+        for expert_idx, expert in enumerate(self.experts):
+            # Get masks for this expert
+            expert_mask = expert_masks[expert_idx]  # (num_groups, group_size)
+            weight_mask = weight_masks[expert_idx]  # (num_groups, group_size)
+            
+            # Apply mask to input (zero out tokens not routed to this expert)
+            masked_input = x * expert_mask[:, :, None]
+
+            # Process all tokens through expert (masked tokens are zero)
+            processed_tokens = jax.vmap(jax.vmap(expert))(masked_input)
+            
+            # Scale by routing weights
+            scaled_tokens = processed_tokens * weight_mask[:, :, None]
+            
+            # Add to output
+            output += scaled_tokens
+            
+        return output
+
+    def __call__(self, x):
+        """Apply mixture of experts to input tensor.
+        
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, d_model)
+            
+        Returns:
+            Tuple of (output tensor, router loss)
+        """
+        batch_size, seq_len, _ = x.shape
+        
+        # Compute group size and reshape input
+        group_size, num_groups = self._compute_group_size(batch_size, seq_len)
+        x_grouped = x.reshape(num_groups, group_size, self.d_model)
+        
+        # Calculate expert capacity
+        expert_capacity = max(
+            int(round(self.expert_capacity_factor * group_size / self.num_experts)),
+            self.min_expert_capacity
+        )
+        
+        # Get routing assignments from router
+        if self.training:
+            expert_masks, weight_masks, router_loss = self.router(x_grouped, expert_capacity, use_mask_routing=True)
+        else:
+            expert_indices, routing_weights, router_loss = self.router(x_grouped, expert_capacity)
+        
+        # Process through shared experts (applied to all tokens)
+        output = self._process_shared_experts(x_grouped)
+        
+        # Process through routed experts
+        if self.training:
+            output += self._process_routed_experts_training(x_grouped, expert_masks, weight_masks)
+        else:
+            output += self._process_routed_experts_inference(x_grouped, expert_indices, routing_weights)
+        
+        # Reshape back to original dimensions
+        return output.reshape(batch_size, seq_len, self.d_model), router_loss
 
 class Block(nn.Module):
     """Transformer block with attention and feedforward layers"""
@@ -415,7 +529,6 @@ class Block(nn.Module):
     num_zeros_experts: int = 0
     num_constant_experts: int = 0
     num_noise_experts: int = 0
-    top_k: int = 0
     dtype: jnp.dtype = jnp.bfloat16
     use_gradient_checkpointing: bool = False
     training: bool = False
@@ -438,7 +551,6 @@ class Block(nn.Module):
             num_zeros_experts=self.num_zeros_experts,
             num_constant_experts=self.num_constant_experts,
             num_noise_experts=self.num_noise_experts,
-            top_k=self.top_k,
             dtype=self.dtype,
             training=self.training,
             use_gradient_checkpointing=self.use_gradient_checkpointing
@@ -471,7 +583,6 @@ class Transformer(nn.Module):
     num_zeros_experts: int = 1
     num_constant_experts: int = 2
     num_noise_experts: int = 1
-    top_k: int = 0
     dtype: jnp.dtype = jnp.bfloat16
     use_gradient_checkpointing: bool = False
     training: bool = False
@@ -495,7 +606,6 @@ class Transformer(nn.Module):
                 num_zeros_experts=self.num_zeros_experts,
                 num_constant_experts=self.num_constant_experts,
                 num_noise_experts=self.num_noise_experts,
-                top_k=self.top_k,
                 dtype=self.dtype,
                 use_gradient_checkpointing=self.use_gradient_checkpointing,
                 training=self.training
