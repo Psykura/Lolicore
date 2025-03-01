@@ -59,6 +59,8 @@ DATASET_CONFIG = {
     'name': 'sample-10BT',
     'split': 'train',
 }
+def batch_fn(example):
+    return {k: [v] for k, v in example.items()}
 
 def create_learning_rate_schedule(
     num_train_steps: int,
@@ -176,7 +178,17 @@ def prepare_dataset(tokenizer):
         tokenized_dataset = load_from_disk(TOKENIZED_DATASET_PATH)
         print(f"Loaded tokenized dataset from disk with {len(tokenized_dataset)} examples")
         samples_per_step = BATCH_SIZE * BATCH_MESH_SIZE
-        batched_dataset = tokenized_dataset.batch(samples_per_step, drop_last_batch=True, num_proc=PARALLEL_PROCESSING)
+
+        batched_dataset = tokenized_dataset.map(
+            batch_fn,
+            batched=True,
+            batch_size=samples_per_step,
+            drop_last_batch=True,
+            num_proc=PARALLEL_PROCESSING,
+            desc="Batching examples",
+            cache_file_name=None
+        )
+
         return batched_dataset, len(tokenized_dataset)
 
     dataset = load_dataset(**DATASET_CONFIG, num_proc=PARALLEL_PROCESSING)
