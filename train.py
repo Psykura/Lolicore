@@ -56,7 +56,7 @@ MODEL_CONFIG = {
 # Dataset configuration
 DATASET_CONFIG = {
     'path': 'HuggingFaceFW/fineweb',
-    'name': 'sample-100BT',
+    'name': 'sample-350BT',
     'split': 'train',
 }
 
