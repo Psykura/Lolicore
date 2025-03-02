@@ -24,7 +24,6 @@ MODEL_CONFIG = {
     'vocab_size': PADDED_VOCAB_SIZE,  # GPT-2 vocab size
     'num_experts': 16,
     'num_shared_experts': 1,
-    'top_k': 4,
     'use_gradient_checkpointing': False,
     'training': False,
     'attention_latent_dim': 32,
@@ -67,25 +66,7 @@ def load_model():
     unsharded_dir = os.path.abspath("./checkpoints/checkpoint_20000")
     
     # Initialize model with the same config as during training
-    model = Transformer(
-        num_blocks=MODEL_CONFIG['num_blocks'],
-        num_heads=MODEL_CONFIG['num_heads'],
-        d_model=MODEL_CONFIG['d_model'],
-        hidden_size=MODEL_CONFIG['hidden_size'],
-        max_seq_length=MODEL_CONFIG['max_seq_length'],
-        vocab_size=MODEL_CONFIG['vocab_size'],
-        num_experts=MODEL_CONFIG['num_experts'],
-        num_shared_experts=MODEL_CONFIG['num_shared_experts'],
-        top_k=MODEL_CONFIG['top_k'],
-        dtype=DTYPE,
-        use_gradient_checkpointing=MODEL_CONFIG['use_gradient_checkpointing'],
-        training=MODEL_CONFIG['training'],
-        attention_latent_dim=MODEL_CONFIG['attention_latent_dim'],
-        num_zeros_experts=MODEL_CONFIG['num_zeros_experts'],
-        num_constant_experts=MODEL_CONFIG['num_constant_experts'],
-        num_noise_experts=MODEL_CONFIG['num_noise_experts'],
-    )
-
+    model = create_model()
     # Initialize with random weights - don't JIT this part
     rng = jax.random.PRNGKey(0)
     dummy_input = jnp.ones((1, CONTEXT_LENGTH), dtype=jnp.int32)
@@ -112,8 +93,7 @@ def load_model():
 def generate_text(prompt, model, state, tokenizer, 
                  max_new_tokens=50,  # Reduced from 100 to 50 for faster generation
                  temperature=0.2,
-                 top_k=50,
-                 timeout_seconds=30):  # Add timeout to prevent hanging
+                 top_k=50):  # Add timeout to prevent hanging
     """Generate text using a simple autoregressive approach with timeout."""
     # Tokenize the prompt
     input_tokens = tokenizer(prompt, return_tensors="np")
@@ -134,12 +114,6 @@ def generate_text(prompt, model, state, tokenizer,
     
     # Generate tokens one by one with timeout
     for i in range(max_new_tokens):
-        # Check for timeout
-        current_time = time.time()
-        if current_time - start_time > timeout_seconds:
-            print(f"Generation timed out after {i} tokens and {current_time - start_time:.2f} seconds")
-            break
-            
         # Get model output for the current sequence using JIT-compiled forward pass
         # Only use the last 128 tokens to reduce memory usage for long sequences
         context_window = min(128, generated_ids.shape[1])
