@@ -54,7 +54,6 @@ MODEL_CONFIG = {
     'attention_latent_dim': 64,
     'num_constant_experts': 3,
     'num_noise_experts': 1,
-    'dtype': DTYPE,
 }
 
 # Dataset configuration
