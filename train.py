@@ -21,6 +21,8 @@ from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 import wandb
 from jax.experimental.multihost_utils import sync_global_devices
 import numpy as np
+import collections
+import itertools
 
 # This script trains a Transformer model with MoE (Mixture of Experts) architecture
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
@@ -579,6 +581,18 @@ def get_param_spec(param, path):
     # Default for remaining matrices
     return P('batch', 'model')
 
+def prefetch(iterator, size):
+    queue = collections.deque()
+
+    def enqueue(n):  # Enqueues *up to* `n` elements from the iterator.
+        for data in itertools.islice(iterator, n):
+            queue.append(data)
+
+    enqueue(size)  # Fill up the buffer.
+    while queue:
+        yield queue.popleft()
+        enqueue(1)
+
 def create_prefetch_batches(dataset, indices, samples_per_step, mesh, num_prefetch=2):
     """Creates an iterator that prefetches batches while training."""
     # Create batch indices
@@ -594,7 +608,7 @@ def create_prefetch_batches(dataset, indices, samples_per_step, mesh, num_prefet
     
     # Create prefetch iterator
     batch_iter = map(_prepare_batch, batch_indices)
-    return jax_utils.prefetch_to_device(batch_iter, num_prefetch)
+    return prefetch(batch_iter, num_prefetch)
 
 def main():
     # Initialize tokenizer
