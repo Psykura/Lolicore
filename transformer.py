@@ -150,7 +150,7 @@ class MultiHeadAttention(nn.Module):
 
         # Replace matmul with einsum for better performance and readability
         # Original: scores = jnp.matmul(q, k.transpose(0, 1, 3, 2)) / scale
-        scores = jax.lax.einsum('bnqd,bnkd->bnqk', q, k) / scale
+        scores = jnp.einsum('bnqd,bnkd->bnqk', q, k) / scale
 
         # MEMORY OPTIMIZATION: Apply masking directly without materializing full masks
         
@@ -188,7 +188,7 @@ class MultiHeadAttention(nn.Module):
         
         # Apply attention weights to values using einsum instead of matmul
         # Original: attended = jnp.matmul(attn_weights, v)
-        attended = jax.lax.einsum('bnqk,bnkd->bnqd', attn_weights, v)
+        attended = jnp.einsum('bnqk,bnkd->bnqd', attn_weights, v)
 
         # Reshape back
         attended = jnp.transpose(attended, (0, 2, 1, 3))
