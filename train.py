@@ -326,8 +326,10 @@ def create_batch(mesh, examples):
                         spec = P(None)
                 
                 # Apply sharding
+                value = jnp.array(value)
                 sharded_examples[key] = jax.device_put(value, NamedSharding(mesh, spec))
             else:
+                value = jnp.array(value)
                 # For non-array values, just pass through
                 sharded_examples[key] = value
         
