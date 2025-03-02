@@ -282,11 +282,11 @@ def prepare_dataset(tokenizer):
     tokenized_dataset = tokenized_dataset.with_format("numpy")
     return tokenized_dataset, len(tokenized_dataset)
 
-def create_batch(mesh, examples):
+def create_batch(mesh, inputs):
     """Create a sharded batch from dataset examples."""
     # Convert to JAX arrays and ensure attention_mask is properly shaped
-    batch_data = {}
-    for k, v in examples.items():
+    examples = {}
+    for k, v in inputs.items():
         if k == 'attention_mask':
             # Ensure each attention mask is exactly CONTEXT_LENGTH
             masks = []
@@ -300,9 +300,9 @@ def create_batch(mesh, examples):
                     masks.append(list(mask) + padding)
                 else:
                     masks.append(mask)
-            batch_data[k] = jnp.array(masks)
+            examples[k] = jnp.array(masks)
         else:
-            batch_data[k] = jnp.array(v)
+            examples[k] = jnp.array(v)
     
     # Check if we're using a 3D mesh with expert dimension
     mesh_axes = mesh.axis_names
