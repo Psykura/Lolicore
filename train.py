@@ -8,7 +8,6 @@ import optax
 from datasets import load_dataset, load_from_disk
 from transformers import AutoTokenizer
 from flax.training import train_state
-import numpy as np
 from typing import Dict, Tuple
 from functools import partial
 from flax import jax_utils
@@ -176,21 +175,7 @@ def prepare_dataset(tokenizer):
     if os.path.exists(TOKENIZED_DATASET_PATH):
         tokenized_dataset = load_from_disk(TOKENIZED_DATASET_PATH)
         print(f"Loaded tokenized dataset from disk with {len(tokenized_dataset)} examples")
-        samples_per_step = BATCH_SIZE * BATCH_MESH_SIZE
-
-        batched_dataset = tokenized_dataset.map(
-            batch_fn,
-            batched=True,
-            batch_size=samples_per_step,
-            drop_last_batch=True,
-            num_proc=PARALLEL_PROCESSING,
-            desc="Batching examples",
-            cache_file_name=None,
-            load_from_cache_file=False,
-            keep_in_memory=True
-        )
-
-        return batched_dataset, len(tokenized_dataset)
+        return tokenized_dataset, len(tokenized_dataset)
 
     dataset = load_dataset(**DATASET_CONFIG, num_proc=PARALLEL_PROCESSING)
     print(f"Raw dataset size: {len(dataset)}")
@@ -250,20 +235,28 @@ def prepare_dataset(tokenizer):
     )
 
     print(f"Processed dataset size: {len(tokenized_dataset)}")
-
     tokenized_dataset.save_to_disk(TOKENIZED_DATASET_PATH)
+    
+    return tokenized_dataset, len(tokenized_dataset)
 
-    # Calculate batch size for dataset
-    samples_per_step = BATCH_SIZE * BATCH_MESH_SIZE
+def create_batch(examples):
+    """Create a batch from a list of examples."""
+    # Initialize batch with empty lists
+    batch = {
+        'input_ids': [],
+        'attention_mask': [], 
+        'labels': []
+    }
     
-    # Batch the dataset
-    print(f"Batching dataset with {samples_per_step} samples per batch...")
-    batched_dataset = tokenized_dataset.batch(samples_per_step, drop_last_batch=True, num_proc=PARALLEL_PROCESSING)
-    
-    # Save batched dataset to disk
-    print(f"Batched dataset saved to disk with {len(batched_dataset)} batches")
-    
-    return batched_dataset, len(tokenized_dataset)
+    # Fill batch with examples
+    for example in examples:
+        for key in batch:
+            batch[key].append(example[key])
+            
+    # Convert to JAX arrays
+    batch = {k: jnp.array(v) for k, v in batch.items()}
+        
+    return batch
 
 @jax.jit
 def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rngs: jax.random.PRNGKey):
@@ -366,8 +359,8 @@ def main():
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True)
 
-    # Prepare datasets - now returns both batched dataset and original dataset size
-    batched_dataset, dataset_size = prepare_dataset(tokenizer)
+    # Prepare datasets - now returns tokenized dataset without batching
+    tokenized_dataset, dataset_size = prepare_dataset(tokenizer)
 
     # if jax_smi is installed, track memory usage
     import sys
@@ -404,11 +397,12 @@ def main():
     sync_global_devices('mesh_created')
 
     # Calculate steps per epoch and total steps
-    steps_per_epoch = len(batched_dataset)  # Now this is just the number of batches
+    samples_per_step = BATCH_SIZE * BATCH_MESH_SIZE
+    steps_per_epoch = len(tokenized_dataset) // samples_per_step
     total_steps = steps_per_epoch * NUM_EPOCHS
 
     print(f"Original dataset size: {dataset_size}")
-    print(f"Number of batches: {len(batched_dataset)}")
+    print(f"Tokenized dataset size: {len(tokenized_dataset)}")
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Total steps: {total_steps}")
 
@@ -478,38 +472,47 @@ def main():
 
         for epoch in range(start_epoch, NUM_EPOCHS):
             # Shuffle dataset at the start of each epoch
-            batched_dataset.shuffle(seed=epoch)
-
+            shuffled_indices = jax.random.permutation(jax.random.key(epoch), len(tokenized_dataset))
+            
             print(f"Syncing epoch {epoch} for process {jax.process_index()}")
             sync_global_devices(f'epoch_{epoch}')
 
             # Create tqdm progress bar for each epoch
             progress_bar = tqdm(
-                enumerate(batched_dataset),
-                total=steps_per_epoch,
+                range(steps_per_epoch),
                 desc=f"Epoch {epoch+1}/{NUM_EPOCHS}",
                 position=0
             )
 
             # Skip batches if we're resuming from middle of an epoch
-            if epoch == start_epoch and start_batch_idx > 0:
-                print(f"Skipping to batch {start_batch_idx} in epoch {epoch+1}")
-                # Process only the remaining batches in this epoch
-                progress_bar = tqdm(
-                    enumerate(list(batched_dataset)[start_batch_idx:], start=start_batch_idx),
-                    total=steps_per_epoch,
-                    desc=f"Epoch {epoch+1}/{NUM_EPOCHS}",
-                    position=0,
-                    initial=start_batch_idx
-                )
-
-            for batch_idx, batch in progress_bar:
+            start_idx = start_batch_idx if epoch == start_epoch else 0
+            
+            for batch_idx in range(start_idx, steps_per_epoch):
+                # Dynamically create batch
+                batch_start_idx = batch_idx * samples_per_step
+                batch_end_idx = min((batch_idx + 1) * samples_per_step, len(tokenized_dataset))
+                
+                # Get indices for this batch
+                batch_indices = shuffled_indices[batch_start_idx:batch_end_idx]
+                
+                # Skip if batch is too small (should not happen with proper steps calculation)
+                if len(batch_indices) < samples_per_step:
+                    continue
+                
+                # Get examples for this batch
+                batch_examples = [tokenized_dataset[int(i)] for i in batch_indices]
+                
+                # Create batch
+                batch = create_batch(batch_examples)
+                
                 # Prepare batch with proper sharding
-                batch = {k: jnp.array(v) for k, v in batch.items()}
                 batch = jax.device_put(batch, NamedSharding(mesh, P('batch', None)))
 
                 # Train step with sharding
                 state, metrics = train_step(state, batch, rngs=rng)
+
+                # Update progress bar
+                progress_bar.update(1)
 
                 if batch_idx % 50 == 0:
                     # Convert JAX arrays to float values for formatting
