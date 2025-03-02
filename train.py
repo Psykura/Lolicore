@@ -96,6 +96,38 @@ def create_learning_rate_schedule(
 
     return schedule_fn
 
+def debug_param_sharding(params, param_shardings):
+    """Print out parameter shapes and their sharding specifications for debugging."""
+    print("\n=== Parameter Sharding Debug Information ===")
+    print(f"{'Parameter Path':<60} {'Shape':<20} {'Size (MB)':<12} {'Sharding':<15}")
+    print("-" * 110)
+    
+    # Flatten the parameter tree for easier iteration
+    flat_params = jax.tree_util.tree_flatten_with_path(params)[0]
+    flat_shardings = jax.tree_util.tree_flatten_with_path(param_shardings)[0]
+    
+    # Sort by parameter size (descending)
+    param_info = []
+    for (path, param), (_, sharding) in zip(flat_params, flat_shardings):
+        path_str = '.'.join(str(p) for p in path)
+        shape_str = str(param.shape)
+        size_mb = param.size * param.dtype.itemsize / (1024 * 1024)
+        sharding_str = str(sharding.spec)
+        param_info.append((path_str, shape_str, size_mb, sharding_str))
+    
+    # Sort by size (largest first)
+    param_info.sort(key=lambda x: x[2], reverse=True)
+    
+    # Print information
+    total_size_mb = 0
+    for path_str, shape_str, size_mb, sharding_str in param_info:
+        print(f"{path_str[:57]+'...' if len(path_str) > 60 else path_str:<60} {shape_str:<20} {size_mb:<12.2f} {sharding_str:<15}")
+        total_size_mb += size_mb
+    
+    print("-" * 110)
+    print(f"Total parameter size: {total_size_mb:.2f} MB")
+    print("=" * 110 + "\n")
+
 def create_train_state(
     rng: jax.random.PRNGKey,
     mesh: Mesh,
@@ -159,6 +191,10 @@ def create_train_state(
             lambda path, p: NamedSharding(mesh, get_param_spec(p, path)),
             cpu_variables['params']
         )
+
+        # Debug parameter sharding decisions
+        if jax.process_index() == 0:  # Only print on main process
+            debug_param_sharding(cpu_variables['params'], param_shardings)
 
         # Transfer CPU parameters to mesh with appropriate sharding
         sharded_params = jax.device_put(cpu_variables['params'], param_shardings)
@@ -248,9 +284,73 @@ def prepare_dataset(tokenizer):
     return tokenized_dataset, len(tokenized_dataset)
 
 def create_batch(mesh, examples):
-    """Create a sharded batch from dataset examples."""    
-    # Apply sharding to each array in the batch
-    return jax.device_put(examples, NamedSharding(mesh, P('batch', None)))
+    """Create a sharded batch from dataset examples."""
+    # Check if we're using a 3D mesh with expert dimension
+    mesh_axes = mesh.axis_names
+    has_expert_dim = 'expert' in mesh_axes
+    
+    # Handle different types of batch data structures
+    if isinstance(examples, dict):
+        # For dictionary of arrays (typical dataset format)
+        sharded_examples = {}
+        for key, value in examples.items():
+            # Determine appropriate sharding based on array dimensionality
+            if hasattr(value, 'ndim'):
+                ndim = value.ndim
+                if ndim >= 2:
+                    # For 2D+ arrays, shard on batch dimension
+                    if has_expert_dim:
+                        spec = P(None, 'batch', None)
+                    else:
+                        spec = P('batch', None)
+                elif ndim == 1:
+                    # For 1D arrays, replicate across devices
+                    if has_expert_dim:
+                        spec = P(None, None, None)
+                    else:
+                        spec = P(None)
+                else:
+                    # For scalars, replicate
+                    if has_expert_dim:
+                        spec = P(None, None, None)
+                    else:
+                        spec = P(None)
+                
+                # Apply sharding
+                sharded_examples[key] = jax.device_put(value, NamedSharding(mesh, spec))
+            else:
+                # For non-array values, just pass through
+                sharded_examples[key] = value
+        
+        return sharded_examples
+    else:
+        # For single array or other data structure
+        if hasattr(examples, 'ndim'):
+            ndim = examples.ndim
+            if ndim >= 2:
+                # For 2D+ arrays, shard on batch dimension
+                if has_expert_dim:
+                    spec = P(None, 'batch', None)
+                else:
+                    spec = P('batch', None)
+            elif ndim == 1:
+                # For 1D arrays, replicate across devices
+                if has_expert_dim:
+                    spec = P(None, None, None)
+                else:
+                    spec = P(None)
+            else:
+                # For scalars, replicate
+                if has_expert_dim:
+                    spec = P(None, None, None)
+                else:
+                    spec = P(None)
+            
+            # Apply sharding
+            return jax.device_put(examples, NamedSharding(mesh, spec))
+        else:
+            # For non-array values, just pass through
+            return examples
 
 @jax.jit
 def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rngs: jax.random.PRNGKey):
@@ -305,50 +405,177 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
 
     return new_state, metrics
 
+def create_mesh():
+    """Create an optimized device mesh for training MoE models.
+    
+    For MoE models, we use a 3D mesh with dimensions:
+    - 'expert': to shard experts across devices
+    - 'model': to shard model parameters
+    - 'batch': to shard batch dimension
+    
+    This allows for more efficient expert parallelism in addition to
+    model and data parallelism.
+    """
+    devices = jax.devices()
+    n_devices = len(devices)
+    
+    # Determine optimal mesh shape based on number of devices
+    # For MoE models, we want to prioritize expert parallelism
+    
+    # Get number of experts from model config
+    num_experts = MODEL_CONFIG['num_experts']
+    
+    # Calculate factors of n_devices to find optimal mesh shape
+    factors = []
+    for i in range(1, int(n_devices**0.5) + 1):
+        if n_devices % i == 0:
+            factors.append((i, n_devices // i))
+    
+    # Choose mesh shape based on number of experts and available devices
+    if n_devices >= 8:
+        # For 8+ devices, use 3D mesh with expert dimension
+        
+        # Find best expert dimension size (closest to num_experts but not exceeding n_devices)
+        expert_dim = 1
+        for i in range(1, min(num_experts, n_devices) + 1):
+            if n_devices % i == 0:
+                expert_dim = i
+        
+        # Calculate remaining dimensions
+        remaining_devices = n_devices // expert_dim
+        
+        # Find optimal split for model and batch dimensions
+        model_dim = max(1, int(remaining_devices**0.5))
+        while remaining_devices % model_dim != 0:
+            model_dim -= 1
+        
+        batch_dim = remaining_devices // model_dim
+        
+        # Create 3D mesh
+        mesh_shape = (expert_dim, model_dim, batch_dim)
+        mesh = jax.make_mesh(mesh_shape, ('expert', 'model', 'batch'))
+        
+        print(f"Using 3D mesh with shape: expert={expert_dim}, model={model_dim}, batch={batch_dim}")
+    else:
+        # For fewer devices, fall back to 2D mesh
+        model_dim = max(factors, key=lambda x: abs(x[0] - x[1]))[0]
+        batch_dim = n_devices // model_dim
+        
+        mesh_shape = (model_dim, batch_dim)
+        mesh = jax.make_mesh(mesh_shape, ('model', 'batch'))
+        
+        print(f"Using 2D mesh with shape: model={model_dim}, batch={batch_dim}")
+    
+    return mesh, n_devices
+
+# Update get_param_spec to handle 3D mesh with expert dimension
 def get_param_spec(param, path):
-    print(path)
     """Get parameter sharding specification based on parameter path and shape."""
-    # Output layer (usually the largest due to vocab size)
-    if 'output_proj' in path:
-        return P('batch', 'model')  # Shard on both dimensions
-
-    # Token embeddings (also large due to vocab size)
-    if 'token_embedding' in path:
-        return P('model', 'batch')  # Shard on both dimensions
-
-    # Expert parameters - distribute evenly
-    if 'experts' in path:
-        if 'kernel' in path or param.ndim == 2:
-            return P('batch', 'model')  # Alternate dimension order
+    path_str = str(path).lower()
+    
+    # Check if we're using a 3D mesh with expert dimension
+    mesh_axes = jax.devices().mesh_axes if hasattr(jax.devices(), 'mesh_axes') else None
+    has_expert_dim = mesh_axes is not None and 'expert' in mesh_axes
+    
+    # 1. Expert-specific sharding for 3D mesh
+    if has_expert_dim and 'experts' in path_str:
+        # Router parameters
+        if 'router' in path_str:
+            if 'gate' in path_str and 'kernel' in path_str:
+                # Router gate parameters - shard across expert and model dimensions
+                return P('expert', 'model', None)
+            # Other router parameters
+            return P('expert', None, None)
+            
+        # Expert feed-forward layers - shard experts across expert dimension
+        if 'feedforward' in path_str or 'feed_forward' in path_str:
+            if 'kernel' in path_str or param.ndim == 2:
+                if 'keys' in path_str:
+                    # First FFN matrix (d_model -> hidden_size)
+                    return P('expert', None, 'model')
+                elif 'values' in path_str:
+                    # Second FFN matrix (hidden_size -> d_model)
+                    return P('expert', 'model', None)
+            # Bias terms
+            return P('expert', None, None)
+            
+        # Default expert parameters with expert dimension
+        if param.ndim == 2:
+            return P('expert', 'model', 'batch')
+        return P('expert', 'model', None)
+    
+    # 2. Vocabulary-related parameters (largest tensors)
+    if 'output_proj' in path_str and 'kernel' in path_str:
+        return P(None, 'model', 'batch') if has_expert_dim else P('model', 'batch')
+    
+    if 'token_embedding' in path_str and 'embedding' in path_str:
+        return P(None, 'model', 'batch') if has_expert_dim else P('model', 'batch')
+    
+    # 3. Expert-related parameters for 2D mesh
+    if 'experts' in path_str:
+        # Router parameters
+        if 'router' in path_str:
+            if 'gate' in path_str and 'kernel' in path_str:
+                return P('model', None)
+            return P(None)
+        
+        # Expert feed-forward layers
+        if 'feedforward' in path_str or 'feed_forward' in path_str:
+            if 'kernel' in path_str or param.ndim == 2:
+                if 'keys' in path_str:
+                    return P(None, 'model')
+                elif 'values' in path_str:
+                    return P('model', None)
+            return P(None)
+            
+        # Jump module parameters
+        if 'jump' in path_str:
+            return P(None)
+            
+        # Default expert parameters
+        if param.ndim == 2:
+            return P('batch', 'model')
         return P('model')
-
-    # Dense layers and attention
-    if any(x in path for x in ['Dense', 'attention']):
-        if 'kernel' in path or param.ndim == 2:
-            if param.size > 100_000:  # Large matrices
-                return P('batch', 'model')  # Alternate dimension order
-            return P('model', None)
-        return P('model')  # Vectors
-
-    # Small parameters - replicate to avoid communication overhead
+    
+    # 4. Attention-related parameters
+    if 'attention' in path_str:
+        if has_expert_dim:
+            if 'q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str:
+                if 'kernel' in path_str:
+                    return P(None, None, 'model')
+                return P(None, None, None)
+            
+            if 'out_proj' in path_str:
+                if 'kernel' in path_str:
+                    return P(None, 'model', None)
+                return P(None, None, None)
+                
+            return P(None, 'model', None)
+        else:
+            if 'q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str:
+                if 'kernel' in path_str:
+                    return P(None, 'model')
+                return P(None)
+            
+            if 'out_proj' in path_str:
+                if 'kernel' in path_str:
+                    return P('model', None)
+                return P(None)
+                
+            return P('model')
+    
+    # 5. Layer normalization parameters
+    if 'norm' in path_str or 'layernorm' in path_str or 'rmsnorm' in path_str:
+        return P(None) if not has_expert_dim else P(None, None, None)
+    
+    # 6. Size-based fallbacks
     if param.size < 10_000:
-        return P(None)
-
-    # Default for other parameters
+        return P(None) if not has_expert_dim else P(None, None, None)
+    
     if param.ndim <= 1:
         return P('model')
     return P('batch', 'model')  # Alternate dimension order for remaining matrices
 
-
-def create_mesh():
-    """Create a more balanced device mesh for TPU."""
-    devices = jax.devices()
-    n_devices = len(devices)
-
-    mesh_shape = (n_devices // BATCH_MESH_SIZE, BATCH_MESH_SIZE) 
-
-    mesh = jax.make_mesh(mesh_shape, ('model', 'batch'))
-    return mesh, n_devices
 
 def main():
     # Initialize tokenizer
@@ -498,6 +725,8 @@ def main():
                 
                 # Get examples for this batch
                 batch_examples = tokenized_dataset[batch_indices]
+
+                print(batch_examples)
                 
                 # Create batch
                 batch = create_batch(mesh, batch_examples)
