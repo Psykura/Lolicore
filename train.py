@@ -517,52 +517,48 @@ def get_param_spec(param, path):
     
     # 1. Output projection and embedding layers - split across all dimensions
     if 'output_proj' in path_str and 'kernel' in path_str:
-        # Split vocabulary dimension across expert/model dimensions
         return P('expert', 'model', 'batch') if has_expert_dim else P('model', 'batch')
     
     if 'token_embedding' in path_str and 'embedding' in path_str:
-        # Split embedding table across expert and model dimensions
         return P('expert', 'model', None) if has_expert_dim else P('model', None)
 
-    # 2. Attention projection layers - more aggressive sharding
+    # 2. Attention projection layers
     if 'attention' in path_str:
         if has_expert_dim:
             if 'q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str:
                 if 'kernel' in path_str:
-                    # Split input and output dimensions
                     return P('expert', None, 'model')
             if 'out_proj' in path_str and 'kernel' in path_str:
-                # Split both input and output dimensions
                 return P('expert', 'model', None)
         else:
             if 'out_proj' in path_str and 'kernel' in path_str:
-                # Split across both model and batch dimensions
                 return P('model', 'batch')
 
-    # 3. Router parameters - split gate matrix across experts
+    # 3. Router parameters
     if 'router' in path_str and 'gate' in path_str and 'kernel' in path_str:
         return P('expert', 'model', None) if has_expert_dim else P('model', None)
 
-    # 4. Expert FFN layers - optimize kernel sharding
+    # 4. Expert FFN layers
     if 'experts' in path_str and ('keys' in path_str or 'values' in path_str):
         if has_expert_dim:
-            # Split hidden dimension across expert and model dimensions
             return P('expert', 'model', None)
         else:
-            # Split across model and batch dimensions
             return P('model', 'batch')
 
-    # 5. Layer normalization parameters
+    # 5. Layer normalization parameters - always replicate 1D params
     if 'norm' in path_str or 'layernorm' in path_str or 'rmsnorm' in path_str:
-        return P(None) if not has_expert_dim else P(None, None, None)
+        return P(None)  # Changed from 3D None spec
     
-    # 6. Size-based fallbacks
+    # 6. Size-based fallbacks - replicate small params
     if param.size < 10_000:
-        return P(None) if not has_expert_dim else P(None, None, None)
+        return P(None)  # Changed from 3D None spec
     
+    # 7. Handle 1D parameters safely
     if param.ndim <= 1:
-        return P('model')
-    return P('batch', 'model')  # Alternate dimension order for remaining matrices
+        return P(None)  # Changed from sharding along 'model'
+    
+    # Default for remaining matrices
+    return P('batch', 'model')
 
 
 def main():
