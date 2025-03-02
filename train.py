@@ -309,63 +309,40 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
     return new_state, metrics
 
 def get_param_spec(param, path):
-    """Improved parameter sharding specification with MoE-aware distribution."""
-    path_str = '/'.join(map(str, path)).lower()
-    
-    # Check parameter rank (number of dimensions)
-    param_rank = param.ndim
-    
-    # For 1D parameters (vectors, biases), only use 'model' or None
-    if param_rank == 1:
-        # Small 1D parameters should be replicated
-        if param.size < 2**14:  # 16KB threshold
-            return P(None)
-        # Larger 1D parameters should be sharded along model dimension
-        return P('model')
-    
-    # For 0D parameters (scalars), always replicate
-    if param_rank == 0:
-        return P(None)
+    """Get parameter sharding specification based on parameter path and shape."""
+    path = path.lower()
 
-    # Now handle 2D+ parameters with specific rules
-    
-    # 1. Embedding layers - split vocabulary dimension
-    if 'token_embedding' in path_str:
-        return P('model', None)  # Split vocab across model axis
+    # Output layer (usually the largest due to vocab size)
+    if 'output_proj' in path:
+        return P('batch', 'model')  # Shard on both dimensions
 
-    # 2. Attention layers - optimized for tensor parallelism
-    if 'attention' in path_str:
-        if 'q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str:
-            return P(None, 'model') if param_rank == 2 else P('model')
-        if 'out_proj' in path_str:
-            return P('model', None)  # Split output dimension
+    # Token embeddings (also large due to vocab size)
+    if 'token_embedding' in path:
+        return P('model', 'batch')  # Shard on both dimensions
 
-    # 3. Expert layers - distribute experts across devices
-    if 'experts' in path_str:
-        if 'kernel' in path_str and param_rank == 2:
-            # Split expert weights across model and batch dimensions
-            return P('model', 'batch')
-        # Replicate small expert parameters
-        return P('model') if param.size > 1e5 else P(None)
-
-    # 4. Output projection - split vocabulary dimension
-    if 'output_proj' in path_str:
-        return P('model', 'batch')  # Split both dimensions
-
-    # 5. FFN layers - optimized for model parallelism
-    if 'dense' in path_str or 'values' in path_str or 'keys' in path_str:
-        if param_rank == 2:
-            return P('model', None)  # Split input dimension
+    # Expert parameters - distribute evenly
+    if 'experts' in path:
+        if 'kernel' in path or param.ndim == 2:
+            return P('batch', 'model')  # Alternate dimension order
         return P('model')
 
-    # 6. Small parameters - replicate to avoid communication overhead
-    if param.size < 2**14:  # 16KB threshold
+    # Dense layers and attention
+    if any(x in path for x in ['dense', 'attention']):
+        if 'kernel' in path or param.ndim == 2:
+            if param.size > 100_000:  # Large matrices
+                return P('batch', 'model')  # Alternate dimension order
+            return P('model', None)
+        return P('model')  # Vectors
+
+    # Small parameters - replicate to avoid communication overhead
+    if param.size < 10_000:
         return P(None)
 
-    # Default sharding for large parameters
-    if param_rank == 2:
-        return P('model', None)  # For matrices
-    return P('model')  # For higher-rank tensors
+    # Default for other parameters
+    if param.ndim <= 1:
+        return P('model')
+    return P('batch', 'model')  # Alternate dimension order for remaining matrices
+
 
 def create_mesh():
     """Create a more balanced device mesh for TPU."""
