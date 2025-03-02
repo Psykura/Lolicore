@@ -714,8 +714,13 @@ def main():
         print(f"Starting training from step {step} (epoch {start_epoch}, batch {start_batch_idx})")
 
         for epoch in range(start_epoch, NUM_EPOCHS):
-            # Replace dynamic batch creation with pre-batched dataset
-            shuffled_indices = jax.random.permutation(jax.random.key(epoch), len(tokenized_dataset))
+            # Create random key and permutation on CPU to avoid device memory issues
+            cpu_key = jax.random.key(epoch)
+            cpu_key = jax.device_put(cpu_key, jax.devices("cpu")[0])
+            shuffled_indices = jax.device_put(
+                jax.random.permutation(cpu_key, len(tokenized_dataset)),
+                jax.devices("cpu")[0]
+            )
             
             print(f"Syncing epoch {epoch} for process {jax.process_index()}")
             sync_global_devices(f'epoch_{epoch}')
@@ -744,8 +749,6 @@ def main():
                 
                 # Get examples for this batch
                 batch_examples = tokenized_dataset[batch_indices]
-
-                print(batch_examples)
                 
                 # Create batch
                 batch = create_batch(mesh, batch_examples)
