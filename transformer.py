@@ -258,9 +258,21 @@ class Router(nn.Module):
         # Reshape for expert-wise token selection
         # (num_experts, num_groups * group_size)
         flat_probs = router_probs.transpose(2, 0, 1).reshape(self.num_experts, -1)
+
+        # Pad with large negative values to ensure they are never selected
+        padding_width = max(0, expert_capacity - flat_probs.shape[1])
+        flat_probs = jnp.pad(
+            flat_probs,
+            ((0, 0), (0, padding_width)),
+            mode='constant',
+            constant_values=-1e9
+        )
         
-        # Select top tokens for each expert
+        # Select top tokens for each expert, now safe since input is padded
         scores, token_indices = jax.lax.top_k(flat_probs, k=expert_capacity)
+        
+        # Zero out scores for padded values
+        scores = jnp.where(scores > -1e8, scores, 0.0)
         
         # Convert flat indices to (group, position) coordinates
         group_indices = token_indices // group_size
