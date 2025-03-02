@@ -297,23 +297,32 @@ def create_batch(mesh, examples):
             # Determine appropriate sharding based on array dimensionality
             if hasattr(value, 'ndim'):
                 ndim = value.ndim
-                if ndim >= 2:
-                    # For 2D+ arrays, shard on batch dimension
-                    if has_expert_dim:
-                        spec = P(None, 'batch', None)
+                # Create appropriate sharding spec based on tensor rank and mesh dimensions
+                if has_expert_dim:
+                    # For 3D mesh ('expert', 'model', 'batch')
+                    if ndim == 3:
+                        # For 3D tensors, can use full 3D sharding
+                        spec = P('expert', 'model', 'batch')
+                    elif ndim == 2:
+                        # For 2D tensors, use only 2 dimensions of the mesh
+                        # Shard on model and batch dimensions
+                        spec = P('model', 'batch')
+                    elif ndim == 1:
+                        # For 1D tensors, use only 1 dimension or replicate
+                        spec = P('model')
                     else:
-                        spec = P('batch', None)
-                elif ndim == 1:
-                    # For 1D arrays, replicate across devices
-                    if has_expert_dim:
-                        spec = P(None, None, None)
-                    else:
+                        # For scalars, replicate
                         spec = P(None)
                 else:
-                    # For scalars, replicate
-                    if has_expert_dim:
-                        spec = P(None, None, None)
+                    # For 2D mesh ('model', 'batch')
+                    if ndim >= 2:
+                        # For 2D+ tensors, shard on batch dimension
+                        spec = P('batch', None)
+                    elif ndim == 1:
+                        # For 1D tensors, replicate
+                        spec = P(None)
                     else:
+                        # For scalars, replicate
                         spec = P(None)
                 
                 # Apply sharding
@@ -327,23 +336,33 @@ def create_batch(mesh, examples):
         # For single array or other data structure
         if hasattr(examples, 'ndim'):
             ndim = examples.ndim
-            if ndim >= 2:
-                # For 2D+ arrays, shard on batch dimension
-                if has_expert_dim:
-                    spec = P(None, 'batch', None)
+            
+            # Create appropriate sharding spec based on tensor rank and mesh dimensions
+            if has_expert_dim:
+                # For 3D mesh ('expert', 'model', 'batch')
+                if ndim == 3:
+                    # For 3D tensors, can use full 3D sharding
+                    spec = P('expert', 'model', 'batch')
+                elif ndim == 2:
+                    # For 2D tensors, use only 2 dimensions of the mesh
+                    # Shard on model and batch dimensions
+                    spec = P('model', 'batch')
+                elif ndim == 1:
+                    # For 1D tensors, use only 1 dimension or replicate
+                    spec = P('model')
                 else:
-                    spec = P('batch', None)
-            elif ndim == 1:
-                # For 1D arrays, replicate across devices
-                if has_expert_dim:
-                    spec = P(None, None, None)
-                else:
+                    # For scalars, replicate
                     spec = P(None)
             else:
-                # For scalars, replicate
-                if has_expert_dim:
-                    spec = P(None, None, None)
+                # For 2D mesh ('model', 'batch')
+                if ndim >= 2:
+                    # For 2D+ tensors, shard on batch dimension
+                    spec = P('batch', None)
+                elif ndim == 1:
+                    # For 1D tensors, replicate
+                    spec = P(None)
                 else:
+                    # For scalars, replicate
                     spec = P(None)
             
             # Apply sharding
