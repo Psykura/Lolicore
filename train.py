@@ -593,7 +593,7 @@ def prefetch(iterator, size):
         yield queue.popleft()
         enqueue(1)
 
-def create_prefetch_batches(dataset, indices, samples_per_step, mesh, num_prefetch=2):
+def create_prefetch_batches(dataset, indices, samples_per_step, mesh, num_prefetch=4):
     """Creates an iterator that prefetches batches while training."""
     # Create batch indices
     batch_indices = [indices[i:i + samples_per_step] 
@@ -740,7 +740,6 @@ def main():
                 shuffled_indices,
                 samples_per_step,
                 mesh,
-                num_prefetch=2  # Adjust based on available memory
             )
 
             # Create tqdm progress bar for each epoch
