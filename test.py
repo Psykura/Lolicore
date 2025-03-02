@@ -27,7 +27,6 @@ MODEL_CONFIG = {
     'use_gradient_checkpointing': False,
     'training': False,
     'attention_latent_dim': 32,
-    'num_zeros_experts': 1,
     'num_constant_experts': 2,
     'num_noise_experts': 1,
 }

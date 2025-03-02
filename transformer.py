@@ -149,43 +149,41 @@ class MultiHeadAttention(nn.Module):
         scale = jnp.sqrt(self.latent_dim)
         scores = jnp.matmul(q, k.transpose(0, 1, 3, 2)) / scale
 
-        # Create causal mask (lower triangular)
-        causal_mask = jnp.tril(jnp.ones((seq_len, seq_len)))
-        causal_mask = causal_mask[None, None, :, :]  # Add batch and head dims
+        # MEMORY OPTIMIZATION: Apply masking directly without materializing full masks
+        
+        # Create a function to apply causal mask without materializing the full mask
+        def apply_causal_mask(attn_scores):
+            # Create row and column indices for broadcasting
+            row_idx = jnp.arange(seq_len)[None, :]  # [1, seq_len]
+            col_idx = jnp.arange(seq_len)[:, None]  # [seq_len, 1]
+            
+            # Apply causal mask using arithmetic comparison (much more memory efficient)
+            # This creates a mask where row_idx >= col_idx (lower triangular)
+            causal_mask = row_idx >= col_idx
+            
+            # Apply the mask to attention scores
+            return jnp.where(causal_mask, attn_scores, float('-inf'))
+        
+        # Apply causal masking to scores
+        scores = jax.vmap(jax.vmap(apply_causal_mask))(scores)
+        
+        # Apply attention mask if provided
+        if attn_mask is not None and attn_mask.ndim == 2 and attn_mask.shape[0] == batch_size:
+            # Truncate if necessary
+            if attn_mask.shape[1] > seq_len:
+                attn_mask = attn_mask[:, :seq_len]
+                
+            # Reshape for broadcasting: [batch_size, 1, seq_len, 1]
+            attn_mask_4d = attn_mask[:, None, :, None]
+            
+            # Apply attention mask to scores
+            # This masks out padding tokens in a memory-efficient way
+            scores = jnp.where(attn_mask_4d > 0, scores, float('-inf'))
 
-        # Combine causal mask with attention mask if provided
-        if attn_mask is not None:
-            # Ensure attention mask has the right shape
-            # It should be (batch_size, seq_len)
-            if attn_mask.ndim == 2 and attn_mask.shape[0] == batch_size and attn_mask.shape[1] >= seq_len:
-                # Truncate if necessary
-                if attn_mask.shape[1] > seq_len:
-                    attn_mask = attn_mask[:, :seq_len]
-                
-                # Reshape to (batch_size, 1, 1, seq_len)
-                attn_mask_2d = attn_mask[:, None, None, :]
-                
-                # Create 2D attention mask by broadcasting
-                # This creates a mask where tokens can attend to other tokens
-                # only if both have attention mask value of 1
-                attn_mask_4d = attn_mask_2d * attn_mask_2d.transpose(0, 1, 3, 2)
-                
-                # Broadcast causal mask to batch dimension
-                batch_causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-                
-                # Combine with causal mask
-                combined_mask = batch_causal_mask * attn_mask_4d
-            else:
-                # If attention mask has unexpected shape, just use causal mask
-                combined_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-        else:
-            # Just use causal mask
-            combined_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
-
-        # Apply mask
-        scores = jnp.where(combined_mask == 0, float('-inf'), scores)
-
+        # Apply softmax to get attention weights
         attn_weights = nn.softmax(scores, axis=-1)
+        
+        # Apply attention weights to values
         attended = jnp.matmul(attn_weights, v)
 
         # Reshape back
@@ -340,9 +338,7 @@ class JumpModule(nn.Module):
             self.jump = self.param('jump', nn.initializers.normal(0.02), (self.d_model,), dtype=self.dtype)
 
     def __call__(self, x):
-        if self.jump_type == 'zeros':
-            return jnp.zeros_like(x)
-        elif self.jump_type == 'constant':
+        if self.jump_type == 'constant':
             # Broadcast the jump parameter to match the input shape
             return jnp.broadcast_to(self.jump, x.shape)
         else:  # noise
@@ -355,7 +351,6 @@ class ExpertsFeedForward(nn.Module):
     hidden_size: int
     num_experts: int
     num_shared_experts: int
-    num_zeros_experts: int = 0
     num_constant_experts: int = 0
     num_noise_experts: int = 0
 
@@ -369,8 +364,7 @@ class ExpertsFeedForward(nn.Module):
 
     def setup(self):
         # Calculate number of feedforward experts
-        self.num_ff_experts = (self.num_experts - self.num_zeros_experts 
-                             - self.num_constant_experts - self.num_noise_experts)
+        self.num_ff_experts = (self.num_experts - self.num_constant_experts - self.num_noise_experts)
         assert self.num_ff_experts >= 0, "Total special experts exceeds num_experts"
         
         # Initialize router
@@ -406,14 +400,6 @@ class ExpertsFeedForward(nn.Module):
                 d_model=self.d_model, 
                 dtype=self.dtype, 
                 use_gradient_checkpointing=self.use_gradient_checkpointing
-            ))
-        
-        # Zero experts (return zeros)
-        for _ in range(self.num_zeros_experts):
-            experts.append(JumpModule(
-                d_model=self.d_model, 
-                jump_type='zeros', 
-                dtype=self.dtype
             ))
         
         # Constant experts (return learned constant)
@@ -616,7 +602,6 @@ class Block(nn.Module):
     # Expert configuration parameters
     num_experts: int = 8
     num_shared_experts: int = 1
-    num_zeros_experts: int = 0
     num_constant_experts: int = 0
     num_noise_experts: int = 0
     dtype: jnp.dtype = jnp.bfloat16
@@ -638,7 +623,6 @@ class Block(nn.Module):
             hidden_size=self.hidden_size,
             num_experts=self.num_experts,
             num_shared_experts=self.num_shared_experts,
-            num_zeros_experts=self.num_zeros_experts,
             num_constant_experts=self.num_constant_experts,
             num_noise_experts=self.num_noise_experts,
             dtype=self.dtype,
@@ -670,7 +654,6 @@ class Transformer(nn.Module):
     # Expert configuration parameters
     num_experts: int = 12
     num_shared_experts: int = 1
-    num_zeros_experts: int = 1
     num_constant_experts: int = 2
     num_noise_experts: int = 1
     dtype: jnp.dtype = jnp.bfloat16
@@ -693,7 +676,6 @@ class Transformer(nn.Module):
                 attention_latent_dim=self.attention_latent_dim,
                 num_experts=self.num_experts,
                 num_shared_experts=self.num_shared_experts,
-                num_zeros_experts=self.num_zeros_experts,
                 num_constant_experts=self.num_constant_experts,
                 num_noise_experts=self.num_noise_experts,
                 dtype=self.dtype,

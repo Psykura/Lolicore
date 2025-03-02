@@ -48,7 +48,6 @@ MODEL_CONFIG = {
     'num_shared_experts': 1,
     'use_gradient_checkpointing': True,
     'attention_latent_dim': 64,
-    'num_zeros_experts': 1,
     'num_constant_experts': 3,
     'num_noise_experts': 1,
 }
