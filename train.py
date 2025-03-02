@@ -179,7 +179,7 @@ def prepare_dataset(tokenizer):
         tokenized_dataset = load_from_disk(TOKENIZED_DATASET_PATH)
         print(f"Loaded tokenized dataset from disk with {len(tokenized_dataset)} examples")
         tokenized_dataset = tokenized_dataset.with_format("jax")
-        tokenized_dataset = tokenized_dataset.shuffle(seed=42)
+        #tokenized_dataset = tokenized_dataset.shuffle(seed=42)
         tokenized_dataset = tokenized_dataset.prefetch(jax.local_device_count() * 4)
         return tokenized_dataset, len(tokenized_dataset)
 
@@ -245,7 +245,7 @@ def prepare_dataset(tokenizer):
     
     # Add these optimizations before returning:
     tokenized_dataset = tokenized_dataset.with_format("jax")
-    tokenized_dataset = tokenized_dataset.shuffle(seed=42)
+    #tokenized_dataset = tokenized_dataset.shuffle(seed=42)
     tokenized_dataset = tokenized_dataset.prefetch(jax.local_device_count() * 4)
     return tokenized_dataset, len(tokenized_dataset)
 
