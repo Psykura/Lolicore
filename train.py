@@ -250,10 +250,7 @@ def prepare_dataset(tokenizer):
 def create_batch(mesh, examples):
     """Create a sharded batch from dataset examples."""    
     # Apply sharding to each array in the batch
-    return jax.tree_map(
-        lambda x: jax.device_put(x, NamedSharding(mesh, P('batch', None))), 
-        examples
-    )
+    return jax.device_put(examples, NamedSharding(mesh, P('batch', None)))
 
 @jax.jit
 def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rngs: jax.random.PRNGKey):
