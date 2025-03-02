@@ -147,7 +147,10 @@ class MultiHeadAttention(nn.Module):
 
         # Calculate attention scores
         scale = jnp.sqrt(self.latent_dim)
-        scores = jnp.matmul(q, k.transpose(0, 1, 3, 2)) / scale
+
+        # Replace matmul with einsum for better performance and readability
+        # Original: scores = jnp.matmul(q, k.transpose(0, 1, 3, 2)) / scale
+        scores = jax.lax.einsum('bnqd,bnkd->bnqk', q, k) / scale
 
         # MEMORY OPTIMIZATION: Apply masking directly without materializing full masks
         
@@ -183,8 +186,9 @@ class MultiHeadAttention(nn.Module):
         # Apply softmax to get attention weights
         attn_weights = nn.softmax(scores, axis=-1)
         
-        # Apply attention weights to values
-        attended = jnp.matmul(attn_weights, v)
+        # Apply attention weights to values using einsum instead of matmul
+        # Original: attended = jnp.matmul(attn_weights, v)
+        attended = jax.lax.einsum('bnqk,bnkd->bnqd', attn_weights, v)
 
         # Reshape back
         attended = jnp.transpose(attended, (0, 2, 1, 3))
@@ -608,8 +612,14 @@ class Block(nn.Module):
     use_gradient_checkpointing: bool = False
     training: bool = False
 
-    def setup(self):        
-        self.attention = MultiHeadAttention(
+    def setup(self):
+        if self.use_gradient_checkpointing:
+            mha_impl = nn.remat(MultiHeadAttention)
+            ffn_impl = nn.remat(ExpertsFeedForward)
+        else:
+            mha_impl = MultiHeadAttention
+            ffn_impl = ExpertsFeedForward
+        self.attention = mha_impl(
             num_heads=self.num_heads,
             d_model=self.d_model,
             latent_dim=self.attention_latent_dim,
@@ -618,7 +628,7 @@ class Block(nn.Module):
             training=self.training,
             use_gradient_checkpointing=self.use_gradient_checkpointing
         )
-        self.feedforward = ExpertsFeedForward(
+        self.feedforward = ffn_impl(
             d_model=self.d_model,
             hidden_size=self.hidden_size,
             num_experts=self.num_experts,
