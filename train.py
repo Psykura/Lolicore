@@ -32,7 +32,7 @@ NUM_EPOCHS = 5
 LEARNING_RATE = 1e-4
 WARMUP_STEPS = 100
 GRADIENT_CLIP_NORM = 1.0
-BATCH_MESH_SIZE = 2
+BATCH_MESH_SIZE = 4
 DTYPE = jnp.bfloat16  # Set default dtype to bfloat16
 PARALLEL_PROCESSING = 16
 TOKENIZED_DATASET_PATH = '/mnt/dataset/tokenized_dataset'
@@ -248,10 +248,15 @@ def prepare_dataset(tokenizer):
     return tokenized_dataset, len(tokenized_dataset)
 
 def create_batch(mesh, examples):
-    batch = jax.vmap(lambda e: {'input_ids': e['input_ids'], 
-                                'attention_mask': e['attention_mask'],
-                                'labels': e['labels']})(examples)
-    return jax.tree_map(lambda x: jax.device_put(x, NamedSharding(mesh, P('batch', None))), batch)
+    """Create a sharded batch from dataset examples."""
+    # Convert dataset to dictionary of arrays
+    batch = {k: examples[k] for k in examples.features.keys()}
+    
+    # Apply sharding to each array in the batch
+    return jax.tree_map(
+        lambda x: jax.device_put(x, NamedSharding(mesh, P('batch', None))), 
+        batch
+    )
 
 @jax.jit
 def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rngs: jax.random.PRNGKey):
@@ -307,38 +312,45 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
     return new_state, metrics
 
 def get_param_spec(param, path):
-    """Get parameter sharding specification based on parameter path and shape."""
+    """Improved parameter sharding specification with MoE-aware distribution."""
+    path_str = '/'.join(map(str, path))
 
-    # Output layer (usually the largest due to vocab size)
-    if 'output_proj' in path:
-        return P('batch', 'model')  # Shard on both dimensions
+    # 1. Embedding layers - split vocabulary dimension
+    if 'token_embedding' in path_str:
+        return P('model', None)  # Split vocab across model axis
 
-    # Token embeddings (also large due to vocab size)
-    if 'token_embedding' in path:
-        return P('model', 'batch')  # Shard on both dimensions
+    # 2. Attention layers - optimized for tensor parallelism
+    if 'attention' in path_str:
+        if 'q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str:
+            return P(None, 'model') if param.ndim == 2 else P('model')
+        if 'out_proj' in path_str:
+            return P('model', None)  # Split output dimension
 
-    # Expert parameters - distribute evenly
-    if 'experts' in path:
-        if 'kernel' in path or param.ndim == 2:
-            return P('batch', 'model')  # Alternate dimension order
+    # 3. Expert layers - distribute experts across devices
+    if 'experts' in path_str:
+        expert_idx = int(path_str.split('/')[2])  # Extract expert index
+        if 'kernel' in path_str and param.ndim == 2:
+            # Split expert weights across model and batch dimensions
+            return P('model', 'batch')
+        # Replicate small expert parameters
+        return P('model') if param.size > 1e5 else P(None)
+
+    # 4. Output projection - split vocabulary dimension
+    if 'output_proj' in path_str:
+        return P('model', 'batch')  # Split both dimensions
+
+    # 5. FFN layers - optimized for model parallelism
+    if 'Dense' in path_str or 'values' in path_str or 'keys' in path_str:
+        if param.ndim == 2:
+            return P('model', None)  # Split input dimension
         return P('model')
 
-    # Dense layers and attention
-    if any(x in path for x in ['Dense', 'attention']):
-        if 'kernel' in path or param.ndim == 2:
-            if param.size > 100_000:  # Large matrices
-                return P('batch', 'model')  # Alternate dimension order
-            return P('model', None)
-        return P('model')  # Vectors
-
-    # Small parameters - replicate to avoid communication overhead
-    if param.size < 10_000:
+    # 6. Small parameters - replicate to avoid communication overhead
+    if param.size < 2**14:  # 16KB threshold
         return P(None)
 
-    # Default for other parameters
-    if param.ndim <= 1:
-        return P('model')
-    return P('batch', 'model')  # Alternate dimension order for remaining matrices
+    # Default sharding for large parameters
+    return P('model')
 
 def create_mesh():
     """Create a more balanced device mesh for TPU."""
@@ -497,7 +509,6 @@ def main():
                     continue
                 
                 # Get examples for this batch
-                # batch_examples = [tokenized_dataset[i] for i in batch_indices]
                 batch_examples = tokenized_dataset[batch_indices]
                 
                 # Create batch
