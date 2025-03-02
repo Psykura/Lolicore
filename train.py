@@ -248,14 +248,11 @@ def prepare_dataset(tokenizer):
     return tokenized_dataset, len(tokenized_dataset)
 
 def create_batch(mesh, examples):
-    """Create a sharded batch from dataset examples."""
-    # Convert dataset to dictionary of arrays
-    batch = {k: examples[k] for k in examples.features.keys()}
-    
+    """Create a sharded batch from dataset examples."""    
     # Apply sharding to each array in the batch
     return jax.tree_map(
         lambda x: jax.device_put(x, NamedSharding(mesh, P('batch', None))), 
-        batch
+        examples
     )
 
 @jax.jit
@@ -313,7 +310,7 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
 
 def get_param_spec(param, path):
     """Improved parameter sharding specification with MoE-aware distribution."""
-    path_str = '/'.join(map(str, path))
+    path_str = '/'.join(map(str, path)).lower()
     
     # Check parameter rank (number of dimensions)
     param_rank = param.ndim
@@ -356,7 +353,7 @@ def get_param_spec(param, path):
         return P('model', 'batch')  # Split both dimensions
 
     # 5. FFN layers - optimized for model parallelism
-    if 'Dense' in path_str or 'values' in path_str or 'keys' in path_str:
+    if 'dense' in path_str or 'values' in path_str or 'keys' in path_str:
         if param_rank == 2:
             return P('model', None)  # Split input dimension
         return P('model')
