@@ -62,8 +62,6 @@ DATASET_CONFIG = {
     'name': 'sample-10BT',
     'split': 'train',
 }
-def batch_fn(example):
-    return {k: [v] for k, v in example.items()}
 
 def create_learning_rate_schedule(
     num_train_steps: int,
@@ -181,7 +179,7 @@ def prepare_dataset(tokenizer):
         tokenized_dataset = load_from_disk(TOKENIZED_DATASET_PATH)
         print(f"Loaded tokenized dataset from disk with {len(tokenized_dataset)} examples")
         tokenized_dataset = tokenized_dataset.with_format("jax")
-        tokenized_dataset = tokenized_dataset.shuffle(seed=42, buffer_size=10_000)
+        tokenized_dataset = tokenized_dataset.shuffle(seed=42)
         tokenized_dataset = tokenized_dataset.prefetch(jax.local_device_count() * 4)
         return tokenized_dataset, len(tokenized_dataset)
 
@@ -247,17 +245,14 @@ def prepare_dataset(tokenizer):
     
     # Add these optimizations before returning:
     tokenized_dataset = tokenized_dataset.with_format("jax")
-    tokenized_dataset = tokenized_dataset.shuffle(seed=42, buffer_size=10_000)
+    tokenized_dataset = tokenized_dataset.shuffle(seed=42)
     tokenized_dataset = tokenized_dataset.prefetch(jax.local_device_count() * 4)
     return tokenized_dataset, len(tokenized_dataset)
 
 def create_batch(mesh, examples):
-    # Convert to JAX arrays and ensure proper padding
-    batch = {
-        'input_ids': jnp.array([e['input_ids'] for e in examples], dtype=jnp.int32),
-        'attention_mask': jnp.array([e['attention_mask'] for e in examples], dtype=jnp.int32),
-        'labels': jnp.array([e['labels'] for e in examples], dtype=jnp.int32)
-    }
+    batch = jax.vmap(lambda e: {'input_ids': e['input_ids'], 
+                                'attention_mask': e['attention_mask'],
+                                'labels': e['labels']})(examples)
     return jax.tree_map(lambda x: jax.device_put(x, NamedSharding(mesh, P('batch', None))), batch)
 
 @jax.jit
@@ -476,8 +471,7 @@ def main():
 
         for epoch in range(start_epoch, NUM_EPOCHS):
             # Replace dynamic batch creation with pre-batched dataset
-
-            shuffled_indices = np.random.permutation(len(tokenized_dataset))
+            shuffled_indices = jax.random.permutation(jax.random.key(epoch), len(tokenized_dataset))
             
             print(f"Syncing epoch {epoch} for process {jax.process_index()}")
             sync_global_devices(f'epoch_{epoch}')
@@ -509,7 +503,7 @@ def main():
                 batch_examples = tokenized_dataset[batch_indices]
                 
                 # Create batch
-                batch = create_batch(batch_examples)
+                batch = create_batch(mesh, batch_examples)
                 
                 # Train step with sharding
                 state, metrics = train_step(state, batch, rngs=rng)
