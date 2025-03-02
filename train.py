@@ -216,6 +216,14 @@ def prepare_dataset(tokenizer):
         print(f"Loaded tokenized dataset from disk with {len(tokenized_dataset)} examples")
         # Use numpy format for dataset
         tokenized_dataset = tokenized_dataset.with_format("numpy")
+        # Ensure attention_mask is truncated to CONTEXT_LENGTH
+        def truncate_attention_mask(example):
+            if len(example['attention_mask']) > CONTEXT_LENGTH:
+                example['attention_mask'] = example['attention_mask'][:CONTEXT_LENGTH]
+            return example
+        
+        # Apply truncation to each example
+        tokenized_dataset = tokenized_dataset.map(truncate_attention_mask, cache_file_name=None)
         return tokenized_dataset, len(tokenized_dataset)
 
     dataset = load_dataset(**DATASET_CONFIG, num_proc=PARALLEL_PROCESSING)
@@ -326,10 +334,8 @@ def create_batch(mesh, examples):
                         spec = P(None)
                 
                 # Apply sharding
-                value = jnp.array(value)
                 sharded_examples[key] = jax.device_put(value, NamedSharding(mesh, spec))
             else:
-                value = jnp.array(value)
                 # For non-array values, just pass through
                 sharded_examples[key] = value
         
@@ -716,13 +722,7 @@ def main():
         print(f"Starting training from step {step} (epoch {start_epoch}, batch {start_batch_idx})")
 
         for epoch in range(start_epoch, NUM_EPOCHS):
-            # Create random key and permutation on CPU to avoid device memory issues
-            cpu_key = jax.random.key(epoch)
-            cpu_key = jax.device_put(cpu_key, jax.devices("cpu")[0])
-            shuffled_indices = jax.device_put(
-                jax.random.permutation(cpu_key, len(tokenized_dataset)),
-                jax.devices("cpu")[0]
-            )
+            shuffled_indices = np.random.RandomState(seed=epoch).permutation(len(tokenized_dataset))
             
             print(f"Syncing epoch {epoch} for process {jax.process_index()}")
             sync_global_devices(f'epoch_{epoch}')
