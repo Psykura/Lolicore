@@ -16,6 +16,8 @@ from tqdm import tqdm
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 import wandb
 from jax.experimental.multihost_utils import sync_global_devices
+import numpy as np
+
 # This script trains a Transformer model with MoE (Mixture of Experts) architecture
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
 
@@ -208,10 +210,10 @@ def prepare_dataset(tokenizer):
                 if len(chunk) < CONTEXT_LENGTH:
                     # Calculate padding length
                     padding_length = CONTEXT_LENGTH - len(chunk)
-                    # Pad the chunk with EOS tokens
-                    chunk = chunk + [tokenizer.eos_token_id] * padding_length
                     # Create attention mask with 1s for real tokens and 0s for padding
                     attention_mask = [1] * len(chunk) + [0] * padding_length
+                    # Pad the chunk with EOS tokens
+                    chunk = chunk + [tokenizer.eos_token_id] * padding_length
                 else:
                     # No padding needed, attention mask is all 1s
                     attention_mask = [1] * CONTEXT_LENGTH
@@ -241,21 +243,40 @@ def prepare_dataset(tokenizer):
 
 def create_batch(examples):
     """Create a batch from a list of examples."""
-    # Initialize batch with empty lists
-    batch = {
-        'input_ids': [],
-        'attention_mask': [], 
-        'labels': []
-    }
+    # Extract all keys from the first example to initialize
+    keys = ['input_ids', 'attention_mask', 'labels']
+    num_examples = len(examples)
     
-    # Fill batch with examples
-    for example in examples:
-        for key in batch:
-            batch[key].append(example[key])
-            
-    # Convert to JAX arrays
-    batch = {k: jnp.array(v) for k, v in batch.items()}
+    # First pass: collect all sequences and find max lengths in one loop
+    batch = {}
+    max_lengths = {}
+    
+    for key in keys:
+        # Initialize lists and track max length
+        sequences = []
+        max_len = 0
         
+        # Collect all sequences for this key and track max length
+        for example in examples:
+            seq = example[key]
+            sequences.append(seq)
+            max_len = max(max_len, len(seq))
+        
+        batch[key] = sequences
+        max_lengths[key] = max_len
+    
+    # Second pass: create padded arrays for all keys at once
+    for key in keys:
+        # Pre-allocate a padded array of the right shape
+        padded_array = np.zeros((num_examples, max_lengths[key]), dtype=np.int32)
+        
+        # Fill the array with actual values
+        for i, seq in enumerate(batch[key]):
+            padded_array[i, :len(seq)] = seq
+        
+        # Replace with the padded array
+        batch[key] = jnp.array(padded_array)  # Convert directly to JAX array
+    
     return batch
 
 @jax.jit
