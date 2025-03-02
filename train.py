@@ -298,7 +298,6 @@ def prepare_dataset(tokenizer):
     
     # Add these optimizations before returning:
     # Use numpy format instead of JAX
-    tokenized_dataset = tokenized_dataset.with_format("numpy")
     return tokenized_dataset, len(tokenized_dataset)
 
 def create_batch(mesh, inputs):
@@ -580,6 +579,22 @@ def get_param_spec(param, path):
     # Default for remaining matrices
     return P('batch', 'model')
 
+def create_prefetch_batches(dataset, indices, samples_per_step, mesh, num_prefetch=2):
+    """Creates an iterator that prefetches batches while training."""
+    # Create batch indices
+    batch_indices = [indices[i:i + samples_per_step] 
+                    for i in range(0, len(indices), samples_per_step)]
+    
+    # Filter out incomplete batches
+    batch_indices = [idx for idx in batch_indices if len(idx) == samples_per_step]
+    
+    def _prepare_batch(batch_idx):
+        batch_examples = dataset[batch_idx]
+        return create_batch(mesh, batch_examples)
+    
+    # Create prefetch iterator
+    batch_iter = map(_prepare_batch, batch_indices)
+    return jax_utils.prefetch_to_device(batch_iter, num_prefetch)
 
 def main():
     # Initialize tokenizer
@@ -699,10 +714,20 @@ def main():
         print(f"Starting training from step {step} (epoch {start_epoch}, batch {start_batch_idx})")
 
         for epoch in range(start_epoch, NUM_EPOCHS):
+            # Create shuffled indices for this epoch
             shuffled_indices = np.random.RandomState(seed=epoch).permutation(len(tokenized_dataset))
             
             print(f"Syncing epoch {epoch} for process {jax.process_index()}")
             sync_global_devices(f'epoch_{epoch}')
+
+            # Create prefetching iterator for batches
+            batch_iterator = create_prefetch_batches(
+                tokenized_dataset,
+                shuffled_indices,
+                samples_per_step,
+                mesh,
+                num_prefetch=2  # Adjust based on available memory
+            )
 
             # Create tqdm progress bar for each epoch
             progress_bar = tqdm(
@@ -712,67 +737,58 @@ def main():
             )
 
             # Skip batches if we're resuming from middle of an epoch
-            start_idx = start_batch_idx if epoch == start_epoch else 0
+            if epoch == start_epoch and start_batch_idx > 0:
+                for _ in range(start_batch_idx):
+                    next(batch_iterator)
             
-            for batch_idx in range(start_idx, steps_per_epoch):
-                # Dynamically create batch
-                batch_start_idx = batch_idx * samples_per_step
-                batch_end_idx = min((batch_idx + 1) * samples_per_step, len(tokenized_dataset))
-                
-                # Get indices for this batch
-                batch_indices = shuffled_indices[batch_start_idx:batch_end_idx]
-                
-                # Skip if batch is too small
-                if len(batch_indices) < samples_per_step:
-                    continue
-                
-                # Get examples as numpy arrays and convert to JAX on CPU
-                batch_examples = tokenized_dataset[batch_indices]
-                
-                # Create batch
-                batch = create_batch(mesh, batch_examples)
-                
-                # Train step with sharding
-                state, metrics = train_step(state, batch, rngs=rng)
+            for batch_idx in range(start_batch_idx if epoch == start_epoch else 0, steps_per_epoch):
+                try:
+                    # Get next prefetched batch
+                    batch = next(batch_iterator)
+                    
+                    # Train step with sharding
+                    state, metrics = train_step(state, batch, rngs=rng)
 
-                # Update progress bar
-                progress_bar.update(1)
+                    # Update progress bar and logging (existing code)
+                    progress_bar.update(1)
 
-                if batch_idx % 50 == 0:
-                    # Convert JAX arrays to float values for formatting
-                    metrics = {
-                        'loss': float(metrics['loss']),
-                        'main_loss': float(metrics['main_loss']),
-                        'router_loss': float(metrics['router_loss'])
-                    }
-                    progress_bar.set_postfix({
-                        'loss': f"{metrics['loss']:.4f}",
-                        'main_loss': f"{metrics['main_loss']:.4f}",
-                        'router_loss': f"{metrics['router_loss']:.4f}"
-                    })
-
-                    if jax.process_index() == 0:
-                        # Log metrics to wandb
-                        wandb.log({
-                            'train/loss': metrics['loss'],
-                            'train/main_loss': metrics['main_loss'],
-                            'train/router_loss': metrics['router_loss'],
-                            'train/step': step,
-                            'train/epoch': epoch + (batch_idx / steps_per_epoch)
+                    if batch_idx % 50 == 0:
+                        metrics = {
+                            'loss': float(metrics['loss']),
+                            'main_loss': float(metrics['main_loss']),
+                            'router_loss': float(metrics['router_loss'])
+                        }
+                        progress_bar.set_postfix({
+                            'loss': f"{metrics['loss']:.4f}",
+                            'main_loss': f"{metrics['main_loss']:.4f}",
+                            'router_loss': f"{metrics['router_loss']:.4f}"
                         })
 
-                # Save checkpoint periodically
-                if (batch_idx % 5000 == 0 or step % 5000 == 0) and step != 0:
-                    print(f"\nSaving checkpoint at step {step}...")
-                    checkpoints.save_checkpoint_multiprocess(
-                        ckpt_dir=CHECKPOINT_DIR,
-                        target=state,
-                        step=step,
-                        overwrite=True
-                    )
-                    print(f"Checkpoint saved at {os.path.join(CHECKPOINT_DIR, f'checkpoint_{step}')}")
+                        if jax.process_index() == 0:
+                            wandb.log({
+                                'train/loss': metrics['loss'],
+                                'train/main_loss': metrics['main_loss'],
+                                'train/router_loss': metrics['router_loss'],
+                                'train/step': step,
+                                'train/epoch': epoch + (batch_idx / steps_per_epoch)
+                            })
 
-                step += 1
+                    # Checkpoint saving (existing code)
+                    if (batch_idx % 5000 == 0 or step % 5000 == 0) and step != 0:
+                        print(f"\nSaving checkpoint at step {step}...")
+                        checkpoints.save_checkpoint_multiprocess(
+                            ckpt_dir=CHECKPOINT_DIR,
+                            target=state,
+                            step=step,
+                            overwrite=True
+                        )
+                        print(f"Checkpoint saved at {os.path.join(CHECKPOINT_DIR, f'checkpoint_{step}')}")
+
+                    step += 1
+                    
+                except StopIteration:
+                    print(f"Reached end of dataset in epoch {epoch}")
+                    break
 
         # Close wandb run when training is complete
         if jax.process_index() == 0:
