@@ -309,9 +309,8 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
     return new_state, metrics
 
 def get_param_spec(param, path):
+    print(path)
     """Get parameter sharding specification based on parameter path and shape."""
-    path = path.lower()
-
     # Output layer (usually the largest due to vocab size)
     if 'output_proj' in path:
         return P('batch', 'model')  # Shard on both dimensions
@@ -327,7 +326,7 @@ def get_param_spec(param, path):
         return P('model')
 
     # Dense layers and attention
-    if any(x in path for x in ['dense', 'attention']):
+    if any(x in path for x in ['Dense', 'attention']):
         if 'kernel' in path or param.ndim == 2:
             if param.size > 100_000:  # Large matrices
                 return P('batch', 'model')  # Alternate dimension order
