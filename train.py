@@ -48,11 +48,11 @@ MODEL_CONFIG = {
     'hidden_size': 4096,
     'max_seq_length': CONTEXT_LENGTH,
     'vocab_size': vocab_size,  # GPT-2 vocab size
-    'num_experts': 28,
+    'num_experts': 16,
     'num_shared_experts': 1,
     'use_gradient_checkpointing': True,
-    'attention_latent_dim': 64,
-    'num_constant_experts': 3,
+    'attention_latent_dim': 48,
+    'num_constant_experts': 4,
     'num_noise_experts': 1,
 }
 
