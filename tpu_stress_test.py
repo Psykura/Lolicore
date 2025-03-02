@@ -3,6 +3,8 @@ import jax.numpy as jnp
 import time
 from functools import partial
 import numpy as np
+import signal
+import sys
 
 def print_device_info():
     """Print information about the available devices."""
@@ -85,6 +87,82 @@ def stress_test(matrix_size=8192, num_iterations=100, warmup=10):
     # Return a small sample of the result to verify correctness
     return result[0, 0]
 
+def continuous_stress_test(matrix_size=8192):
+    """
+    Run a continuous stress test until interrupted with Ctrl+C.
+    
+    Args:
+        matrix_size: Size of the square matrices to multiply
+    """
+    print(f"\n=== Starting Continuous TPU Stress Test (Press Ctrl+C to stop) ===\n")
+    
+    # Register signal handler for clean exit
+    def signal_handler(sig, frame):
+        print("\n\n=== Stress Test Interrupted by User ===")
+        print(f"Completed {iteration_count} total iterations")
+        print(f"Total runtime: {time.time() - global_start_time:.2f} seconds")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Use a fixed seed for initial matrices
+    key = jax.random.PRNGKey(42)
+    key, subkey1, subkey2 = jax.random.split(key, 3)
+    
+    # Generate large random matrices
+    print(f"Generating random matrices of size {matrix_size}x{matrix_size}...")
+    a = jax.random.normal(subkey1, (matrix_size, matrix_size))
+    b = jax.random.normal(subkey2, (matrix_size, matrix_size))
+    
+    # Warmup to compile and load the computation to TPU
+    print("Starting warmup iterations...")
+    for i in range(10):
+        result = matrix_multiply(a, b)
+        result.block_until_ready()
+    
+    print("Beginning continuous stress test. Press Ctrl+C to stop.")
+    
+    # Track global stats
+    global_start_time = time.time()
+    iteration_count = 0
+    last_report_time = global_start_time
+    iterations_since_report = 0
+    
+    try:
+        while True:
+            # Generate new random keys
+            key, subkey1, subkey2 = jax.random.split(key, 3)
+            
+            # Update matrices with new random values
+            a = a * jax.random.normal(subkey1, (1, 1))
+            b = b * jax.random.normal(subkey2, (1, 1))
+            
+            # Perform matrix multiplication
+            result = matrix_multiply(a, b)
+            result.block_until_ready()
+            
+            iteration_count += 1
+            iterations_since_report += 1
+            
+            # Report progress every 10 seconds
+            current_time = time.time()
+            if current_time - last_report_time >= 10:
+                elapsed = current_time - last_report_time
+                ops = 2 * (matrix_size ** 3) * iterations_since_report
+                tflops = ops / (elapsed * 10**12)
+                
+                print(f"Status: {iteration_count} iterations completed | " 
+                      f"Running for {current_time - global_start_time:.1f} seconds | "
+                      f"Current performance: {tflops:.2f} TFLOPS")
+                
+                last_report_time = current_time
+                iterations_since_report = 0
+                
+    except Exception as e:
+        print(f"\nError during stress test: {e}")
+        print(f"Completed {iteration_count} iterations before error")
+        print(f"Total runtime: {time.time() - global_start_time:.2f} seconds")
+
 if __name__ == "__main__":
     print_device_info()
     tpu_available = initialize_tpu()
@@ -93,16 +171,5 @@ if __name__ == "__main__":
     # For TPUs, we can use larger matrices
     matrix_size = 8192 if tpu_available else 4096
     
-    print("\n=== Starting TPU Stress Test ===\n")
-    
-    try:
-        result_sample = stress_test(
-            matrix_size=matrix_size,
-            num_iterations=100,
-            warmup=10
-        )
-        print(f"Sample result value: {result_sample}")
-        print("\n=== Stress Test Completed Successfully ===")
-    except Exception as e:
-        print(f"Error during stress test: {e}")
-        print("\n=== Stress Test Failed ===") 
+    # Run continuous stress test until interrupted
+    continuous_stress_test(matrix_size=matrix_size)
