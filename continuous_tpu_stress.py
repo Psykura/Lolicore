@@ -6,8 +6,6 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import random
-from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
-from flax import linen as nn
 from tqdm import tqdm
 import psutil
 import threading
@@ -46,21 +44,6 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# Create a simple MLP model that will stress the TPU
-class StressModel(nn.Module):
-    hidden_dim: int = 4096
-    
-    @nn.compact
-    def __call__(self, x):
-        x = nn.Dense(features=self.hidden_dim, dtype=DTYPE)(x)
-        x = nn.relu(x)
-        x = nn.Dense(features=self.hidden_dim, dtype=DTYPE)(x)
-        x = nn.relu(x)
-        x = nn.Dense(features=self.hidden_dim, dtype=DTYPE)(x)
-        x = nn.relu(x)
-        x = nn.Dense(features=x.shape[-1], dtype=DTYPE)(x)
-        return x
-
 # Create a function that performs intensive matrix operations
 @jax.jit
 def matrix_multiply_stress(key, size, batch_size):
@@ -78,47 +61,38 @@ def matrix_multiply_stress(key, size, batch_size):
     
     return result, key2
 
-# Create a function that uses a neural network for stress testing
-def create_and_apply_model(key, size, batch_size, hidden_dim=4096):
-    # Initialize model
-    model = StressModel(hidden_dim=hidden_dim)
+# Create a function that performs intensive JAX operations (replacing the Flax model)
+@jax.jit
+def jax_intensive_operations(key, size, batch_size):
+    # Generate random matrices
+    key1, key2 = random.split(key)
+    x = random.normal(key1, (batch_size, size, size), dtype=DTYPE)
     
-    # Generate random input
-    key, subkey = random.split(key)
-    x = random.normal(subkey, (batch_size, size, size), dtype=DTYPE)
+    # Series of intensive JAX operations
+    # First layer equivalent
+    w1 = random.normal(key2, (size, size), dtype=DTYPE)
+    b1 = random.normal(random.split(key2)[0], (size,), dtype=DTYPE)
+    y1 = jnp.matmul(x, w1) + b1
+    y1 = jnp.maximum(0, y1)  # ReLU
     
-    # Initialize parameters
-    key, subkey = random.split(key)
-    params = model.init(subkey, x)
+    # Second layer equivalent
+    key2, subkey = random.split(key2)
+    w2 = random.normal(subkey, (size, size), dtype=DTYPE)
+    b2 = random.normal(random.split(subkey)[0], (size,), dtype=DTYPE)
+    y2 = jnp.matmul(y1, w2) + b2
+    y2 = jnp.maximum(0, y2)  # ReLU
     
-    # JIT the forward pass
-    @jax.jit
-    def forward(params, x):
-        return model.apply(params, x)
+    # Third layer equivalent
+    key2, subkey = random.split(key2)
+    w3 = random.normal(subkey, (size, size), dtype=DTYPE)
+    b3 = random.normal(random.split(subkey)[0], (size,), dtype=DTYPE)
+    y3 = jnp.matmul(y2, w3) + b3
     
-    # Apply model
-    result = forward(params, x)
+    # Additional operations to stress the TPU
+    y3 = jnp.sin(y3) + jnp.cos(y3)
+    result = jnp.exp(jnp.tanh(y3 * 0.01))
     
-    return result, key
-
-# Function to create a device mesh for multi-device TPUs
-def create_device_mesh():
-    devices = jax.devices()
-    n_devices = len(devices)
-    
-    if n_devices == 1:
-        # Single device
-        return Mesh(np.array(devices).reshape(1, 1), ('data', 'model'))
-    elif n_devices == 8:
-        # TPU v2/v3 with 8 cores
-        return Mesh(np.array(devices).reshape(2, 4), ('data', 'model'))
-    elif n_devices == 4:
-        # TPU v2/v3 with 4 cores
-        return Mesh(np.array(devices).reshape(2, 2), ('data', 'model'))
-    else:
-        # Generic mesh
-        mesh_shape = (1, n_devices)
-        return Mesh(np.array(devices).reshape(*mesh_shape), ('data', 'model'))
+    return result, key2
 
 # Function to log system stats
 def log_stats():
@@ -175,9 +149,7 @@ def run_continuous_stress_test():
     else:
         print("Will run indefinitely until stopped with Ctrl+C")
     
-    # Create device mesh for multi-device TPUs
-    mesh = create_device_mesh()
-    print(f"Created mesh with shape: {mesh.devices.shape}")
+    # Print JAX device information
     print(f"JAX devices: {jax.devices()}")
     print(f"Number of devices: {jax.device_count()}")
     
@@ -190,9 +162,8 @@ def run_continuous_stress_test():
     
     # Warm up TPU
     print("Warming up TPU...")
-    with mesh:
-        for _ in range(5):
-            _, key = matrix_multiply_stress(key, args.matrix_size, args.batch_size)
+    for _ in range(5):
+        _, key = matrix_multiply_stress(key, args.matrix_size, args.batch_size)
     
     print("Starting continuous stress test...")
     
@@ -204,35 +175,34 @@ def run_continuous_stress_test():
     end_time = time.time() + (args.run_time * 60) if args.run_time > 0 else float('inf')
     
     # Main loop
-    with mesh:
-        while running and time.time() < end_time:
-            # Alternate between matrix multiplication and neural network operations
-            if iteration_count % 2 == 0:
-                _, key = matrix_multiply_stress(key, args.matrix_size, args.batch_size)
-            else:
-                _, key = create_and_apply_model(key, args.matrix_size // 4, args.batch_size * 2)
-            
-            iteration_count += 1
-            
-            # Log stats periodically
-            if args.stats_interval > 0 and time.time() - last_stats_time >= args.stats_interval * 60:
-                log_stats()
-                last_stats_time = time.time()
-            
-            # Run profiling periodically
-            if args.profile_interval > 0 and time.time() - last_profile_time >= args.profile_interval * 60:
-                run_profiling()
-                last_profile_time = time.time()
-            
-            # Print a dot every 10 iterations to show progress without flooding the console
-            if iteration_count % 10 == 0:
-                print(".", end="", flush=True)
-            
-            # Print a newline every 500 dots for readability
-            if iteration_count % 5000 == 0:
-                elapsed = time.time() - start_time
-                iterations_per_second = iteration_count / elapsed if elapsed > 0 else 0
-                print(f" {iteration_count} iterations ({iterations_per_second:.2f}/s)")
+    while running and time.time() < end_time:
+        # Alternate between different JAX operations to stress the TPU
+        if iteration_count % 2 == 0:
+            _, key = matrix_multiply_stress(key, args.matrix_size, args.batch_size)
+        else:
+            _, key = jax_intensive_operations(key, args.matrix_size // 4, args.batch_size * 2)
+        
+        iteration_count += 1
+        
+        # Log stats periodically
+        if args.stats_interval > 0 and time.time() - last_stats_time >= args.stats_interval * 60:
+            log_stats()
+            last_stats_time = time.time()
+        
+        # Run profiling periodically
+        if args.profile_interval > 0 and time.time() - last_profile_time >= args.profile_interval * 60:
+            run_profiling()
+            last_profile_time = time.time()
+        
+        # Print a dot every 10 iterations to show progress without flooding the console
+        if iteration_count % 10 == 0:
+            print(".", end="", flush=True)
+        
+        # Print a newline every 500 dots for readability
+        if iteration_count % 5000 == 0:
+            elapsed = time.time() - start_time
+            iterations_per_second = iteration_count / elapsed if elapsed > 0 else 0
+            print(f" {iteration_count} iterations ({iterations_per_second:.2f}/s)")
     
     # Final stats
     log_stats()
