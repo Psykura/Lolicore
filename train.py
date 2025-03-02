@@ -214,26 +214,7 @@ def prepare_dataset(tokenizer):
     if os.path.exists(TOKENIZED_DATASET_PATH):
         tokenized_dataset = load_from_disk(TOKENIZED_DATASET_PATH)
         print(f"Loaded tokenized dataset from disk with {len(tokenized_dataset)} examples")
-        # Use numpy format for dataset
-        tokenized_dataset = tokenized_dataset.with_format("numpy")
-        # Ensure attention_mask is truncated to CONTEXT_LENGTH
-        def truncate_attention_mask(examples):
-            batch_attention_masks = []
-            for attention_mask in examples['attention_mask']:
-                if len(attention_mask) > CONTEXT_LENGTH:
-                    attention_mask = attention_mask[:CONTEXT_LENGTH]
-                batch_attention_masks.append(attention_mask)
-            examples['attention_mask'] = batch_attention_masks
-            return examples
-        
-        # Apply truncation in batches without writing cache files
-        tokenized_dataset = tokenized_dataset.map(
-            truncate_attention_mask,
-            batched=True,
-            batch_size=1000,
-            cache_file_name=None,
-            writer_batch_size=None
-        )
+        # Use numpy format for dataset   
         return tokenized_dataset, len(tokenized_dataset)
 
     dataset = load_dataset(**DATASET_CONFIG, num_proc=PARALLEL_PROCESSING)
@@ -302,6 +283,25 @@ def prepare_dataset(tokenizer):
     return tokenized_dataset, len(tokenized_dataset)
 
 def create_batch(mesh, examples):
+    # Convert to JAX arrays and ensure attention_mask is properly shaped
+    examples = {}
+    for k, v in examples.items():
+        if k == 'attention_mask':
+            # Ensure each attention mask is exactly CONTEXT_LENGTH
+            masks = []
+            for mask in v:
+                if len(mask) > CONTEXT_LENGTH:
+                    # Truncate if longer than context length
+                    masks.append(mask[:CONTEXT_LENGTH])
+                elif len(mask) < CONTEXT_LENGTH:
+                    # Pad with zeros if shorter
+                    padding = [0] * (CONTEXT_LENGTH - len(mask))
+                    masks.append(list(mask) + padding)
+                else:
+                    masks.append(mask)
+            examples[k] = jnp.array(masks)
+        else:
+            examples[k] = jnp.array(v)
     """Create a sharded batch from dataset examples."""
     # Check if we're using a 3D mesh with expert dimension
     mesh_axes = mesh.axis_names
