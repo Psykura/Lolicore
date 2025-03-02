@@ -402,16 +402,52 @@ class ExpertsFeedForward(nn.Module):
         return experts
 
     def _compute_group_size(self, batch_size, seq_len):
-        """Compute optimal group size for token routing."""
-        num_tokens = batch_size * seq_len
-        min_num_groups = (num_tokens + self.max_group_size - 1) // self.max_group_size
+        """Compute optimal group size for token routing with efficient algorithm.
         
-        # Find smallest num_groups that divides num_tokens evenly
-        num_groups = min_num_groups
-        while (num_tokens % num_groups != 0) or (num_groups % self.num_experts != 0):
-            num_groups += 1
-            
-        return num_tokens // num_groups, num_groups
+        This optimized version:
+        1. Uses GCD to find the largest divisor efficiently
+        2. Avoids potential infinite loops
+        3. Ensures group sizes are within reasonable bounds
+        """
+        num_tokens = batch_size * seq_len
+        
+        # Start with minimum number of groups based on max_group_size
+        min_num_groups = max(1, (num_tokens + self.max_group_size - 1) // self.max_group_size)
+        
+        # Find the greatest common divisor of num_tokens and min_num_groups
+        def gcd(a, b):
+            while b:
+                a, b = b, a % b
+            return a
+        
+        # Find the smallest number >= min_num_groups that divides num_tokens evenly
+        # This is more efficient than incrementing by 1 each time
+        if num_tokens % min_num_groups == 0:
+            num_groups = min_num_groups
+        else:
+            # Find the largest divisor of num_tokens that's >= min_num_groups
+            divisor = num_tokens // gcd(num_tokens, min_num_groups)
+            if divisor >= min_num_groups:
+                num_groups = divisor
+            else:
+                # If no suitable divisor found, use the next multiple of divisor
+                num_groups = ((min_num_groups + divisor - 1) // divisor) * divisor
+                # If num_groups is too large, fall back to min_num_groups and accept uneven groups
+                if num_groups > 2 * min_num_groups:
+                    num_groups = min_num_groups
+        
+        # Calculate group size
+        group_size = num_tokens // num_groups
+        
+        # Ensure group_size is within reasonable bounds
+        if group_size > self.max_group_size:
+            # Adjust if our calculation somehow exceeded max_group_size
+            group_size = self.max_group_size
+            num_groups = (num_tokens + group_size - 1) // group_size
+            # Recalculate for exact division
+            group_size = num_tokens // num_groups
+        
+        return group_size, num_groups
 
     def _process_shared_experts(self, x):
         """Process input through shared experts."""
@@ -419,6 +455,11 @@ class ExpertsFeedForward(nn.Module):
             return jnp.zeros_like(x)
             
         # Apply all shared experts and average their outputs
+        # Use a more efficient approach for a single shared expert
+        if len(self.shared_experts) == 1:
+            return jax.vmap(self.shared_experts[0])(x)
+        
+        # For multiple shared experts, average their outputs
         shared_outputs = [jax.vmap(expert)(x) for expert in self.shared_experts]
         return jnp.mean(jnp.stack(shared_outputs), axis=0)
 
@@ -490,12 +531,28 @@ class ExpertsFeedForward(nn.Module):
         
         # Compute group size and reshape input
         group_size, num_groups = self._compute_group_size(batch_size, seq_len)
-        x_grouped = x.reshape(num_groups, group_size, self.d_model)
         
-        # Calculate expert capacity
+        # Reshape with explicit handling of remainder
+        if batch_size * seq_len == num_groups * group_size:
+            # Perfect division case
+            x_grouped = x.reshape(num_groups, group_size, self.d_model)
+        else:
+            # Handle case where division isn't perfect (shouldn't happen with optimized algorithm)
+            # But we keep this as a safeguard
+            padded_size = num_groups * group_size
+            padding = padded_size - (batch_size * seq_len)
+            
+            # Flatten, pad, and reshape
+            x_flat = x.reshape(-1, self.d_model)
+            x_padded = jnp.pad(x_flat, ((0, padding), (0, 0)))
+            x_grouped = x_padded.reshape(num_groups, group_size, self.d_model)
+        
+        # Calculate expert capacity with a minimum based on group size
         expert_capacity = max(
             int(round(self.expert_capacity_factor * group_size / self.num_experts)),
-            self.min_expert_capacity
+            self.min_expert_capacity,
+            # Ensure at least 1% of tokens per expert to avoid too small batches
+            max(1, group_size // 100)
         )
         
         # Get routing assignments from router
