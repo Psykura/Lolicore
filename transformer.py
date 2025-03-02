@@ -155,11 +155,32 @@ class MultiHeadAttention(nn.Module):
 
         # Combine causal mask with attention mask if provided
         if attn_mask is not None:
-            # Reshape attention mask to include head dimension
-            attn_mask = attn_mask[:, None, :, None] * attn_mask[:, None, None, :]
-            combined_mask = causal_mask * attn_mask
+            # Ensure attention mask has the right shape
+            # It should be (batch_size, seq_len)
+            if attn_mask.ndim == 2 and attn_mask.shape[0] == batch_size and attn_mask.shape[1] >= seq_len:
+                # Truncate if necessary
+                if attn_mask.shape[1] > seq_len:
+                    attn_mask = attn_mask[:, :seq_len]
+                
+                # Reshape to (batch_size, 1, 1, seq_len)
+                attn_mask_2d = attn_mask[:, None, None, :]
+                
+                # Create 2D attention mask by broadcasting
+                # This creates a mask where tokens can attend to other tokens
+                # only if both have attention mask value of 1
+                attn_mask_4d = attn_mask_2d * attn_mask_2d.transpose(0, 1, 3, 2)
+                
+                # Broadcast causal mask to batch dimension
+                batch_causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
+                
+                # Combine with causal mask
+                combined_mask = batch_causal_mask * attn_mask_4d
+            else:
+                # If attention mask has unexpected shape, just use causal mask
+                combined_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
         else:
-            combined_mask = causal_mask
+            # Just use causal mask
+            combined_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
 
         # Apply mask
         scores = jnp.where(combined_mask == 0, float('-inf'), scores)

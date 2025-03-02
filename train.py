@@ -262,6 +262,9 @@ def create_batch(examples):
             sequences.append(seq)
             max_len = max(max_len, len(seq))
         
+        # Ensure max_len doesn't exceed CONTEXT_LENGTH
+        max_len = min(max_len, CONTEXT_LENGTH)
+        
         batch[key] = sequences
         max_lengths[key] = max_len
     
@@ -270,9 +273,9 @@ def create_batch(examples):
         # Pre-allocate a padded array of the right shape
         padded_array = np.zeros((num_examples, max_lengths[key]), dtype=np.int32)
         
-        # Fill the array with actual values
+        # Fill the array with actual values, truncating if necessary
         for i, seq in enumerate(batch[key]):
-            padded_array[i, :len(seq)] = seq
+            padded_array[i, :min(len(seq), max_lengths[key])] = seq[:min(len(seq), max_lengths[key])]
         
         # Replace with the padded array
         batch[key] = jnp.array(padded_array)  # Convert directly to JAX array
