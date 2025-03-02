@@ -328,7 +328,6 @@ def get_param_spec(param, path):
 
     # 3. Expert layers - distribute experts across devices
     if 'experts' in path_str:
-        expert_idx = int(path_str.split('/')[2])  # Extract expert index
         if 'kernel' in path_str and param.ndim == 2:
             # Split expert weights across model and batch dimensions
             return P('model', 'batch')
