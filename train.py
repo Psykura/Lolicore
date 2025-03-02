@@ -12,7 +12,7 @@ import optax
 from datasets import load_dataset, load_from_disk
 from transformers import AutoTokenizer
 from flax.training import train_state
-from typing import Dict, Tuple, List, Optional, Any
+from typing import Dict, Tuple
 from functools import partial
 from flax import jax_utils
 from flax.training import checkpoints
@@ -21,12 +21,11 @@ from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 import wandb
 from jax.experimental.multihost_utils import sync_global_devices
 import numpy as np
-import queue
-import threading
+# Import JAX profiler for TPU usage monitoring
+from jax import profiler
 import time
-from concurrent.futures import ThreadPoolExecutor
-from jax.profiler import start_trace, stop_trace, save_device_memory_profile
 import datetime
+import contextlib
 
 # This script trains a Transformer model with MoE (Mixture of Experts) architecture
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
@@ -344,6 +343,69 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
 
     return new_state, metrics
 
+# Create a profiled version of train_step for detailed analysis
+def create_profiled_train_step():
+    """Creates a profiled version of the train_step function."""
+    # We need to create a non-jitted version for profiling
+    def profiled_train_step(state, batch, rngs):
+        # Start profiling the step
+        with profiler.StepTraceAnnotation("train_step"):
+            # Forward pass
+            with profiler.StepTraceAnnotation("forward_pass"):
+                noise_rng = rngs
+                
+                def loss_fn(params):
+                    with profiler.StepTraceAnnotation("model_apply"):
+                        logits, router_loss = state.apply_fn(
+                            {'params': params},
+                            batch['input_ids'],
+                            batch['attention_mask'],
+                            rngs={'noise': noise_rng}
+                        )
+                    
+                    with profiler.StepTraceAnnotation("loss_computation"):
+                        # Calculate main loss using stable cross entropy
+                        shift_logits = logits[..., :-1, :]
+                        shift_labels = batch['labels'][..., 1:]
+                        
+                        # Compute max for numerical stability
+                        max_logits = jnp.max(shift_logits, axis=-1, keepdims=True)
+                        # Subtract max from logits to prevent overflow
+                        shifted_logits = shift_logits - max_logits
+                        # Compute log sum exp
+                        exp_shifted = jnp.exp(shifted_logits)
+                        log_sum_exp = jnp.log(jnp.sum(exp_shifted, axis=-1, keepdims=True))
+                        # Compute log probabilities
+                        log_probs = shifted_logits - log_sum_exp
+                        # Gather log probs of true labels
+                        label_log_probs = jnp.take_along_axis(log_probs, shift_labels[..., None], axis=-1)
+                        # Return mean negative log likelihood
+                        main_loss = -jnp.mean(label_log_probs)
+                        
+                        # Combine losses in bfloat16
+                        total_loss = main_loss + router_loss
+                    
+                    return total_loss, (main_loss, router_loss)
+            
+            # Gradient computation
+            with profiler.StepTraceAnnotation("gradient_computation"):
+                grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+                (total_loss, aux), grads = grad_fn(state.params)
+            
+            # Parameter update
+            with profiler.StepTraceAnnotation("parameter_update"):
+                new_state = state.apply_gradients(grads=grads)
+            
+            metrics = {
+                'loss': total_loss,
+                'main_loss': aux[0],
+                'router_loss': aux[1]
+            }
+            
+            return new_state, metrics
+    
+    return profiled_train_step
+
 def get_param_spec(param, path):
     """Get parameter sharding specification based on parameter path and shape."""
 
@@ -388,152 +450,63 @@ def create_mesh():
     mesh = jax.make_mesh(mesh_shape, ('model', 'batch'))
     return mesh, n_devices
 
-class BatchPrefetcher:
-    """Prefetches batches in parallel on CPU while model is training on TPU."""
+@contextlib.contextmanager
+def profile_context(profile_name=None, wait_ms=0):
+    """Context manager for profiling a section of code.
     
-    def __init__(self, 
-                 tokenized_dataset, 
-                 shuffled_indices, 
-                 samples_per_step, 
-                 prefetch_size=3,
-                 num_workers=4):
-        """Initialize the batch prefetcher.
-        
-        Args:
-            tokenized_dataset: The tokenized dataset to fetch from
-            shuffled_indices: Shuffled indices for the current epoch
-            samples_per_step: Number of samples per batch
-            prefetch_size: Number of batches to prefetch
-            num_workers: Number of worker threads for parallel processing
-        """
-        self.tokenized_dataset = tokenized_dataset
-        self.shuffled_indices = shuffled_indices
-        self.samples_per_step = samples_per_step
-        self.prefetch_size = prefetch_size
-        self.num_workers = num_workers
-        
-        # Queue to store prefetched batches
-        self.batch_queue = queue.Queue(maxsize=prefetch_size)
-        
-        # Thread pool for parallel batch creation
-        self.executor = ThreadPoolExecutor(max_workers=num_workers)
-        
-        # Flag to signal threads to stop
-        self.stop_event = threading.Event()
-        
-        # Start prefetching thread
-        self.prefetch_thread = threading.Thread(target=self._prefetch_batches_coordinator)
-        self.prefetch_thread.daemon = True
-        self.prefetch_thread.start()
+    Args:
+        profile_name: Name for the profile. If None, a timestamp will be used.
+        wait_ms: Number of milliseconds to wait before starting profiling.
     
-    def _create_single_batch(self, batch_indices):
-        """Create a single batch from indices."""
-        # Get examples for this batch
-        batch_examples = [self.tokenized_dataset[int(i)] for i in batch_indices]
-        
-        # Create batch using the existing create_batch function
-        return create_batch(batch_examples)
+    Usage:
+        with profile_context("my_operation"):
+            # Code to profile
+            result = perform_operation()
+    """
+    # Create profile directory if it doesn't exist
+    profile_dir = os.path.join(os.path.expanduser("~"), "jax_profiles")
+    os.makedirs(profile_dir, exist_ok=True)
     
-    def _prefetch_batches_coordinator(self):
-        """Coordinator thread that submits batch creation tasks to the thread pool."""
-        batch_idx = 0
-        dataset_size = len(self.tokenized_dataset)
-        
-        while not self.stop_event.is_set():
-            # Check if queue has space
-            if self.batch_queue.qsize() < self.prefetch_size:
-                # Calculate batch indices
-                batch_start_idx = batch_idx * self.samples_per_step
-                batch_end_idx = min((batch_idx + 1) * self.samples_per_step, dataset_size)
-                
-                # Get indices for this batch
-                batch_indices = self.shuffled_indices[batch_start_idx:batch_end_idx]
-                
-                # Skip if batch is too small
-                if len(batch_indices) < self.samples_per_step:
-                    batch_idx += 1
-                    continue
-                
-                # Submit batch creation task to thread pool
-                future = self.executor.submit(self._create_single_batch, batch_indices)
-                
-                # Add callback to put result in queue when done
-                future.add_done_callback(self._batch_created_callback)
-                
-                batch_idx += 1
-                
-                # If we've gone through the entire dataset, we're done for this epoch
-                if batch_start_idx >= dataset_size:
-                    # Wait for all submitted tasks to complete
-                    time.sleep(0.1)
-                    break
-            else:
-                # Queue is full, wait a bit
-                time.sleep(0.01)
+    # Generate profile name if not provided
+    if profile_name is None:
+        profile_name = f"profile_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
-    def _batch_created_callback(self, future):
-        """Callback when a batch is created by a worker thread."""
-        try:
-            batch = future.result()
-            self.batch_queue.put(batch)
-        except Exception as e:
-            print(f"Error creating batch: {e}")
+    # Add timestamp to ensure uniqueness
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    full_profile_name = f"{profile_name}_{timestamp}"
+    profile_path = os.path.join(profile_dir, full_profile_name)
     
-    def get_next_batch(self, mesh, timeout=None):
-        """Get the next prefetched batch.
+    # Only profile on the main process
+    if jax.process_index() == 0:
+        print(f"\nStarting profiling: {profile_name}...")
+        if wait_ms > 0:
+            print(f"Waiting {wait_ms}ms before profiling...")
+            time.sleep(wait_ms / 1000.0)
         
-        Args:
-            mesh: Device mesh for sharding
-            timeout: How long to wait for a batch before timing out
+        # Start profiling
+        profiler.start_trace(profile_path)
+    
+    try:
+        # Execute the code being profiled
+        yield
+    finally:
+        # Stop profiling
+        if jax.process_index() == 0:
+            profiler.stop_trace()
+            print(f"Profiling data saved to {profile_path}")
             
-        Returns:
-            The next batch, already sharded for the device mesh
-        """
-        try:
-            # Get batch from queue
-            batch = self.batch_queue.get(timeout=timeout)
-            
-            # Prepare batch with proper sharding
-            sharded_batch = jax.device_put(batch, NamedSharding(mesh, P('batch', None)))
-            
-            return sharded_batch
-        except queue.Empty:
-            print("Warning: Batch queue empty, waiting for next batch...")
-            return None
-    
-    def reset(self, new_shuffled_indices):
-        """Reset the prefetcher for a new epoch.
-        
-        Args:
-            new_shuffled_indices: New shuffled indices for the next epoch
-        """
-        # Signal current prefetching to stop
-        self.stop_event.set()
-        
-        # Clear the queue
-        while not self.batch_queue.empty():
+            # Log to wandb if it's initialized
             try:
-                self.batch_queue.get_nowait()
-            except queue.Empty:
-                break
-        
-        # Reset stop event
-        self.stop_event.clear()
-        
-        # Update shuffled indices
-        self.shuffled_indices = new_shuffled_indices
-        
-        # Start new prefetching thread
-        self.prefetch_thread = threading.Thread(target=self._prefetch_batches_coordinator)
-        self.prefetch_thread.daemon = True
-        self.prefetch_thread.start()
-    
-    def shutdown(self):
-        """Shutdown the prefetcher."""
-        self.stop_event.set()
-        self.executor.shutdown(wait=True)
+                if wandb.run is not None:
+                    wandb.log({"profile_path": profile_path})
+            except:
+                pass
 
 def main():
+    # Create a directory for profiling data
+    PROFILE_DIR = os.path.join(os.path.expanduser("~"), "jax_profiles")
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True)
 
@@ -548,10 +521,6 @@ def main():
 
     CHECKPOINT_DIR = os.path.join(os.path.expanduser("~"), "checkpoints")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    
-    # Create directory for profiling data
-    PROFILE_DIR = os.path.join(os.path.expanduser("~"), "jax_profiles")
-    os.makedirs(PROFILE_DIR, exist_ok=True)
 
     if jax.process_index() == 0:
         # Initialize wandb
@@ -603,13 +572,24 @@ def main():
         step = 0
         latest_checkpoint = checkpoints.latest_checkpoint(CHECKPOINT_DIR)
 
-        # Initialize training state with mesh
-        state = create_train_state(
-            init_rng,
-            mesh=mesh,
-            **MODEL_CONFIG,
-            learning_rate_fn=learning_rate_fn
-        )
+        # Profile model initialization if starting from scratch
+        if not latest_checkpoint:
+            with profile_context("model_initialization"):
+                # Initialize training state with mesh
+                state = create_train_state(
+                    init_rng,
+                    mesh=mesh,
+                    **MODEL_CONFIG,
+                    learning_rate_fn=learning_rate_fn
+                )
+        else:
+            # Initialize training state with mesh (without profiling if loading from checkpoint)
+            state = create_train_state(
+                init_rng,
+                mesh=mesh,
+                **MODEL_CONFIG,
+                learning_rate_fn=learning_rate_fn
+            )
 
         print(f"Syncing training state for process {jax.process_index()}")
         sync_global_devices('training_state_created')
@@ -653,9 +633,44 @@ def main():
         print(f"Starting training from step {step} (epoch {start_epoch}, batch {start_batch_idx})")
 
         # Profiling configuration
-        profile_steps = [100, 500, 1000]  # Steps at which to capture profiles
-        profile_duration_ms = 5000  # Duration of each profile capture in milliseconds
-        memory_profile_steps = [100, 500, 1000]  # Steps at which to capture memory profiles
+        PROFILE_STEPS = 100  # Number of steps to profile
+        PROFILE_FREQUENCY = 1000  # How often to run profiling (every X steps)
+        
+        # Create a profiled version of train_step for detailed analysis
+        profiled_train_step = create_profiled_train_step()
+        
+        # Profile the first few steps if starting from the beginning
+        if step == 0:
+            # Profile the first 10 steps to capture compilation and initial execution
+            with profile_context("initial_training_steps", wait_ms=100):
+                for initial_step in range(min(10, steps_per_epoch)):
+                    # Dynamically create batch
+                    batch_start_idx = initial_step * samples_per_step
+                    batch_end_idx = min((initial_step + 1) * samples_per_step, len(tokenized_dataset))
+                    
+                    # Get indices for this batch
+                    batch_indices = jax.random.permutation(jax.random.key(0), len(tokenized_dataset))[batch_start_idx:batch_end_idx]
+                    
+                    # Skip if batch is too small
+                    if len(batch_indices) < samples_per_step:
+                        continue
+                    
+                    # Get examples for this batch
+                    batch_examples = [tokenized_dataset[int(i)] for i in batch_indices]
+                    
+                    # Create batch
+                    batch = create_batch(batch_examples)
+                    
+                    # Prepare batch with proper sharding
+                    batch = jax.device_put(batch, NamedSharding(mesh, P('batch', None)))
+
+                    # Use the profiled train step for the first few steps
+                    state, metrics = profiled_train_step(state, batch, rngs=rng)
+                    
+                    print(f"Initial profiling step {initial_step}, loss: {float(metrics['loss']):.4f}")
+                
+                # Reset step counter since these were just for profiling
+                step = 0
         
         for epoch in range(start_epoch, NUM_EPOCHS):
             # Shuffle dataset at the start of each epoch
@@ -674,61 +689,81 @@ def main():
             # Skip batches if we're resuming from middle of an epoch
             start_idx = start_batch_idx if epoch == start_epoch else 0
             
-            # Initialize batch prefetcher for this epoch
-            prefetcher = BatchPrefetcher(
-                tokenized_dataset=tokenized_dataset,
-                shuffled_indices=shuffled_indices,
-                samples_per_step=samples_per_step,
-                prefetch_size=3,  # Prefetch 3 batches ahead
-                num_workers=4     # Use 4 worker threads
-            )
-            
             for batch_idx in range(start_idx, steps_per_epoch):
-                # Start profiling if this is a step we want to profile
-                current_step = step + 1  # +1 because we increment step at the end
-                if jax.process_index() == 0 and current_step in profile_steps:
+                # Start profiling at regular intervals if this is the main process
+                should_profile = (step % PROFILE_FREQUENCY == 0) and (jax.process_index() == 0)
+                
+                if should_profile:
                     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    profile_path = os.path.join(PROFILE_DIR, f"profile_step_{current_step}_{timestamp}")
-                    print(f"\nStarting trace profiling at step {current_step}, saving to {profile_path}")
-                    start_trace(profile_path)
-                
-                # Get next batch from prefetcher (already sharded)
-                batch = prefetcher.get_next_batch(mesh, timeout=60)
-                
-                # If batch is None (timeout), create it directly
-                if batch is None:
-                    print("Prefetcher timeout, creating batch directly...")
-                    batch_start_idx = batch_idx * samples_per_step
-                    batch_end_idx = min((batch_idx + 1) * samples_per_step, len(tokenized_dataset))
-                    batch_indices = shuffled_indices[batch_start_idx:batch_end_idx]
+                    profile_name = f"profile_step_{step}_{timestamp}"
+                    profile_path = os.path.join(PROFILE_DIR, profile_name)
+                    print(f"\nStarting profiling for {PROFILE_STEPS} steps at step {step}...")
+                    profiler.start_trace(profile_path)
                     
-                    if len(batch_indices) < samples_per_step:
+                    # Use the detailed profiled train_step for the first step of profiling
+                    if step % PROFILE_FREQUENCY == 0:
+                        # Dynamically create batch
+                        batch_start_idx = batch_idx * samples_per_step
+                        batch_end_idx = min((batch_idx + 1) * samples_per_step, len(tokenized_dataset))
+                        
+                        # Get indices for this batch
+                        batch_indices = shuffled_indices[batch_start_idx:batch_end_idx]
+                        
+                        # Skip if batch is too small
+                        if len(batch_indices) < samples_per_step:
+                            continue
+                        
+                        # Get examples for this batch
+                        batch_examples = [tokenized_dataset[int(i)] for i in batch_indices]
+                        
+                        # Create batch
+                        batch = create_batch(batch_examples)
+                        
+                        # Prepare batch with proper sharding
+                        batch = jax.device_put(batch, NamedSharding(mesh, P('batch', None)))
+                        
+                        # Use profiled train step for detailed insights
+                        state, metrics = profiled_train_step(state, batch, rngs=rng)
+                        
+                        # Update progress bar
+                        progress_bar.update(1)
+                        step += 1
                         continue
-                    
-                    batch_examples = [tokenized_dataset[int(i)] for i in batch_indices]
-                    batch = create_batch(batch_examples)
-                    batch = jax.device_put(batch, NamedSharding(mesh, P('batch', None)))
+                
+                # Dynamically create batch
+                batch_start_idx = batch_idx * samples_per_step
+                batch_end_idx = min((batch_idx + 1) * samples_per_step, len(tokenized_dataset))
+                
+                # Get indices for this batch
+                batch_indices = shuffled_indices[batch_start_idx:batch_end_idx]
+                
+                # Skip if batch is too small (should not happen with proper steps calculation)
+                if len(batch_indices) < samples_per_step:
+                    continue
+                
+                # Get examples for this batch
+                batch_examples = [tokenized_dataset[int(i)] for i in batch_indices]
+                
+                # Create batch
+                batch = create_batch(batch_examples)
+                
+                # Prepare batch with proper sharding
+                batch = jax.device_put(batch, NamedSharding(mesh, P('batch', None)))
 
                 # Train step with sharding
                 state, metrics = train_step(state, batch, rngs=rng)
 
-                # Stop profiling if we started it for this step
-                if jax.process_index() == 0 and current_step in profile_steps:
-                    # Wait for the specified duration before stopping the trace
-                    time.sleep(profile_duration_ms / 1000)
-                    stop_trace()
-                    print(f"Trace profiling completed for step {current_step}")
-                
-                # Capture memory profile if this is a step we want to profile
-                if jax.process_index() == 0 and current_step in memory_profile_steps:
-                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    memory_profile_path = os.path.join(PROFILE_DIR, f"memory_profile_step_{current_step}_{timestamp}.prof")
-                    print(f"\nCapturing memory profile at step {current_step}, saving to {memory_profile_path}")
-                    save_device_memory_profile(memory_profile_path)
-                    print(f"Memory profile captured for step {current_step}")
-
                 # Update progress bar
                 progress_bar.update(1)
+
+                # Stop profiling after PROFILE_STEPS steps if we started profiling
+                if should_profile and (step % PROFILE_FREQUENCY) == PROFILE_STEPS - 1:
+                    profiler.stop_trace()
+                    print(f"Profiling data saved to {profile_path}")
+                    
+                    # Log profile location to wandb if using wandb
+                    if jax.process_index() == 0:
+                        wandb.log({"profile_path": profile_path}, step=step)
 
                 if batch_idx % 50 == 0:
                     # Convert JAX arrays to float values for formatting
@@ -765,9 +800,6 @@ def main():
                     print(f"Checkpoint saved at {os.path.join(CHECKPOINT_DIR, f'checkpoint_{step}')}")
 
                 step += 1
-            
-            # Shutdown prefetcher at the end of the epoch
-            prefetcher.shutdown()
 
         # Close wandb run when training is complete
         if jax.process_index() == 0:
