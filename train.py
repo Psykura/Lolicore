@@ -541,10 +541,12 @@ def main():
     tokenized_dataset, dataset_size = prepare_dataset(tokenizer)
 
     # if jax_smi is installed, track memory usage
-    import sys
-    if 'jax_smi' in sys.modules:
+    try:
         from jax_smi import initialise_tracking
         initialise_tracking()
+        print("JAX SMI initialized")
+    except ImportError:
+        print("JAX SMI not installed, skipping memory tracking")
 
     CHECKPOINT_DIR = os.path.join(os.path.expanduser("~"), "checkpoints")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
