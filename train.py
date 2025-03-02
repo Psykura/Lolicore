@@ -45,7 +45,7 @@ MODEL_CONFIG = {
     'num_blocks': 12,
     'num_heads': 8,
     'd_model': 768,
-    'hidden_size': 4096,
+    'hidden_size': 8192,
     'max_seq_length': CONTEXT_LENGTH,
     'vocab_size': vocab_size,  # GPT-2 vocab size
     'num_experts': 24,
@@ -515,93 +515,43 @@ def get_param_spec(param, path):
     mesh_axes = jax.devices().mesh_axes if hasattr(jax.devices(), 'mesh_axes') else None
     has_expert_dim = mesh_axes is not None and 'expert' in mesh_axes
     
-    # 1. Expert-specific sharding for 3D mesh
-    if has_expert_dim and 'experts' in path_str:
-        # Router parameters
-        if 'router' in path_str:
-            if 'gate' in path_str and 'kernel' in path_str:
-                # Router gate parameters - shard across expert and model dimensions
-                return P('expert', 'model', None)
-            # Other router parameters
-            return P('expert', None, None)
-            
-        # Expert feed-forward layers - shard experts across expert dimension
-        if 'feedforward' in path_str or 'feed_forward' in path_str:
-            if 'kernel' in path_str or param.ndim == 2:
-                if 'keys' in path_str:
-                    # First FFN matrix (d_model -> hidden_size)
-                    return P('expert', None, 'model')
-                elif 'values' in path_str:
-                    # Second FFN matrix (hidden_size -> d_model)
-                    return P('expert', 'model', None)
-            # Bias terms
-            return P('expert', None, None)
-            
-        # Default expert parameters with expert dimension
-        if param.ndim == 2:
-            return P('expert', 'model', 'batch')
-        return P('expert', 'model', None)
-    
-    # 2. Vocabulary-related parameters (largest tensors)
+    # 1. Output projection and embedding layers - split across all dimensions
     if 'output_proj' in path_str and 'kernel' in path_str:
-        return P(None, 'model', 'batch') if has_expert_dim else P('model', 'batch')
+        # Split vocabulary dimension across expert/model dimensions
+        return P('expert', 'model', 'batch') if has_expert_dim else P('model', 'batch')
     
     if 'token_embedding' in path_str and 'embedding' in path_str:
-        return P(None, 'model', 'batch') if has_expert_dim else P('model', 'batch')
-    
-    # 3. Expert-related parameters for 2D mesh
-    if 'experts' in path_str:
-        # Router parameters
-        if 'router' in path_str:
-            if 'gate' in path_str and 'kernel' in path_str:
-                return P('model', None)
-            return P(None)
-        
-        # Expert feed-forward layers
-        if 'feedforward' in path_str or 'feed_forward' in path_str:
-            if 'kernel' in path_str or param.ndim == 2:
-                if 'keys' in path_str:
-                    return P(None, 'model')
-                elif 'values' in path_str:
-                    return P('model', None)
-            return P(None)
-            
-        # Jump module parameters
-        if 'jump' in path_str:
-            return P(None)
-            
-        # Default expert parameters
-        if param.ndim == 2:
-            return P('batch', 'model')
-        return P('model')
-    
-    # 4. Attention-related parameters
+        # Split embedding table across expert and model dimensions
+        return P('expert', 'model', None) if has_expert_dim else P('model', None)
+
+    # 2. Attention projection layers - more aggressive sharding
     if 'attention' in path_str:
         if has_expert_dim:
             if 'q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str:
                 if 'kernel' in path_str:
-                    return P(None, None, 'model')
-                return P(None, None, None)
-            
-            if 'out_proj' in path_str:
-                if 'kernel' in path_str:
-                    return P(None, 'model', None)
-                return P(None, None, None)
-                
-            return P(None, 'model', None)
+                    # Split input and output dimensions
+                    return P('expert', None, 'model')
+            if 'out_proj' in path_str and 'kernel' in path_str:
+                # Split both input and output dimensions
+                return P('expert', 'model', None)
         else:
-            if 'q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str:
-                if 'kernel' in path_str:
-                    return P(None, 'model')
-                return P(None)
-            
-            if 'out_proj' in path_str:
-                if 'kernel' in path_str:
-                    return P('model', None)
-                return P(None)
-                
-            return P('model')
-    
+            if 'out_proj' in path_str and 'kernel' in path_str:
+                # Split across both model and batch dimensions
+                return P('model', 'batch')
+
+    # 3. Router parameters - split gate matrix across experts
+    if 'router' in path_str and 'gate' in path_str and 'kernel' in path_str:
+        return P('expert', 'model', None) if has_expert_dim else P('model', None)
+
+    # 4. Expert FFN layers - optimize kernel sharding
+    if 'experts' in path_str and ('keys' in path_str or 'values' in path_str):
+        if has_expert_dim:
+            # Split hidden dimension across expert and model dimensions
+            return P('expert', 'model', None)
+        else:
+            # Split across model and batch dimensions
+            return P('model', 'batch')
+
     # 5. Layer normalization parameters
     if 'norm' in path_str or 'layernorm' in path_str or 'rmsnorm' in path_str:
         return P(None) if not has_expert_dim else P(None, None, None)
