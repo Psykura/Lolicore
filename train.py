@@ -27,12 +27,12 @@ import numpy as np
 
 # Constants
 CONTEXT_LENGTH = 2048
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 NUM_EPOCHS = 5
 LEARNING_RATE = 1e-4
 WARMUP_STEPS = 100
 GRADIENT_CLIP_NORM = 1.0
-BATCH_MESH_SIZE = 4
+BATCH_MESH_SIZE = 2
 DTYPE = jnp.bfloat16  # Set default dtype to bfloat16
 PARALLEL_PROCESSING = 16
 TOKENIZED_DATASET_PATH = '/mnt/dataset/tokenized_dataset'
@@ -54,6 +54,7 @@ MODEL_CONFIG = {
     'attention_latent_dim': 64,
     'num_constant_experts': 3,
     'num_noise_experts': 1,
+    'dtype': DTYPE,
 }
 
 # Dataset configuration
