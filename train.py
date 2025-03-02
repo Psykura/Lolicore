@@ -191,6 +191,25 @@ def create_train_state(
             lambda path, p: NamedSharding(mesh, get_param_spec(p, path)),
             cpu_variables['params']
         )
+        
+        # Print parameters with inconsistent ndim and spec shape
+        def check_param_spec_consistency(path, param, sharding):
+            spec = sharding.spec
+            # Count non-None dimensions in spec
+            spec_ndim = sum(1 for axis in spec if axis is not None)
+            if spec_ndim != param.ndim:
+                print(f"Inconsistent parameter: {path}")
+                print(f"  Shape: {param.shape} (ndim={param.ndim})")
+                print(f"  Spec: {spec} (effective ndim={spec_ndim})")
+            return sharding
+            
+        if jax.process_index() == 0:  # Only print on main process
+            print("Parameters with inconsistent dimensions:")
+            jax.tree.map_with_path(
+                lambda path, p, s: check_param_spec_consistency(path, p, s),
+                cpu_variables['params'],
+                param_shardings
+            )
 
         # Debug parameter sharding decisions
         if jax.process_index() == 0:  # Only print on main process
@@ -522,15 +541,16 @@ def get_param_spec(param, path):
     if 'token_embedding' in path_str and 'embedding' in path_str:
         return P('expert', 'model', None) if has_expert_dim else P('model', None)
 
-    # 2. Attention projection layers
+    # 2. Attention projection layers - add kernel check
     if 'attention' in path_str:
         if has_expert_dim:
             if 'q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str:
-                if 'kernel' in path_str:
+                if 'kernel' in path_str:  # Only shard kernel matrices
                     return P('expert', None, 'model')
             if 'out_proj' in path_str and 'kernel' in path_str:
                 return P('expert', 'model', None)
         else:
+            # Only apply to kernel parameters, not biases
             if 'out_proj' in path_str and 'kernel' in path_str:
                 return P('model', 'batch')
 
@@ -539,7 +559,7 @@ def get_param_spec(param, path):
         return P('expert', 'model', None) if has_expert_dim else P('model', None)
 
     # 4. Expert FFN layers
-    if 'experts' in path_str and ('keys' in path_str or 'values' in path_str):
+    if 'experts' in path_str and ('keys' in path_str or 'values' in path_str) and 'kernel' in path_str:
         if has_expert_dim:
             return P('expert', 'model', None)
         else:
