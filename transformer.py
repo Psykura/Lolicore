@@ -223,7 +223,7 @@ class Router(nn.Module):
     d_model: int
     num_experts: int
     z_loss_coef: float = 1e-3
-    balance_loss_coef: float = 1e-2
+    balance_loss_coef: float = 4e-2
     dtype: jnp.dtype = jnp.bfloat16
     training: bool = False
     use_gradient_checkpointing: bool = False
