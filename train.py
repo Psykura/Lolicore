@@ -217,13 +217,23 @@ def prepare_dataset(tokenizer):
         # Use numpy format for dataset
         tokenized_dataset = tokenized_dataset.with_format("numpy")
         # Ensure attention_mask is truncated to CONTEXT_LENGTH
-        def truncate_attention_mask(example):
-            if len(example['attention_mask']) > CONTEXT_LENGTH:
-                example['attention_mask'] = example['attention_mask'][:CONTEXT_LENGTH]
-            return example
+        def truncate_attention_mask(examples):
+            batch_attention_masks = []
+            for attention_mask in examples['attention_mask']:
+                if len(attention_mask) > CONTEXT_LENGTH:
+                    attention_mask = attention_mask[:CONTEXT_LENGTH]
+                batch_attention_masks.append(attention_mask)
+            examples['attention_mask'] = batch_attention_masks
+            return examples
         
-        # Apply truncation to each example
-        tokenized_dataset = tokenized_dataset.map(truncate_attention_mask, cache_file_name=None)
+        # Apply truncation in batches without writing cache files
+        tokenized_dataset = tokenized_dataset.map(
+            truncate_attention_mask,
+            batched=True,
+            batch_size=1000,
+            cache_file_name=None,
+            writer_batch_size=None
+        )
         return tokenized_dataset, len(tokenized_dataset)
 
     dataset = load_dataset(**DATASET_CONFIG, num_proc=PARALLEL_PROCESSING)
