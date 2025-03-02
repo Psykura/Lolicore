@@ -45,7 +45,7 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 # Create a function that performs intensive matrix operations
-@jax.jit
+@jax.jit(static_argnums=(1, 2))
 def matrix_multiply_stress(key, size, batch_size):
     # Generate random matrices
     key1, key2 = random.split(key)
@@ -62,7 +62,7 @@ def matrix_multiply_stress(key, size, batch_size):
     return result, key2
 
 # Create a function that performs intensive JAX operations (replacing the Flax model)
-@jax.jit
+@jax.jit(static_argnums=(1, 2))
 def jax_intensive_operations(key, size, batch_size):
     # Generate random matrices
     key1, key2 = random.split(key)
