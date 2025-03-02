@@ -214,8 +214,8 @@ def prepare_dataset(tokenizer):
     if os.path.exists(TOKENIZED_DATASET_PATH):
         tokenized_dataset = load_from_disk(TOKENIZED_DATASET_PATH)
         print(f"Loaded tokenized dataset from disk with {len(tokenized_dataset)} examples")
-        tokenized_dataset = tokenized_dataset.with_format("jax")
-        #tokenized_dataset = tokenized_dataset.shuffle(seed=42)
+        # Explicitly set device to CPU for JAX arrays
+        tokenized_dataset = tokenized_dataset.with_format("jax", device=jax.devices("cpu")[0])
         return tokenized_dataset, len(tokenized_dataset)
 
     dataset = load_dataset(**DATASET_CONFIG, num_proc=PARALLEL_PROCESSING)
@@ -279,8 +279,8 @@ def prepare_dataset(tokenizer):
     tokenized_dataset.save_to_disk(TOKENIZED_DATASET_PATH)
     
     # Add these optimizations before returning:
-    tokenized_dataset = tokenized_dataset.with_format("jax")
-    #tokenized_dataset = tokenized_dataset.shuffle(seed=42)
+    # Explicitly set device to CPU for JAX arrays
+    tokenized_dataset = tokenized_dataset.with_format("jax", device=jax.devices("cpu")[0])
     return tokenized_dataset, len(tokenized_dataset)
 
 def create_batch(mesh, examples):
