@@ -425,8 +425,9 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
         shift_labels = batch['labels'][..., 1:]
         # Cast to float32 for loss calculation
         shift_logits = shift_logits.astype(jnp.float32)
-        shift_labels = shift_labels.astype(jnp.int32)  # Labels should be integers for sparse cross entropy
-        main_loss = optax.sparse_softmax_cross_entropy(shift_logits, shift_labels)
+        # Convert labels to one-hot encoding for cross entropy
+        shift_labels_one_hot = jax.nn.one_hot(shift_labels, num_classes=logits.shape[-1])
+        main_loss = optax.safe_softmax_cross_entropy(shift_logits, shift_labels_one_hot)
         # Cast router loss to float32 as well for consistency
         router_loss = router_loss.astype(jnp.float32)
 
