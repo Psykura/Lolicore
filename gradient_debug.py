@@ -384,8 +384,7 @@ def run_gradient_debug():
         
         # Log initial parameter statistics
         print("Logging initial parameter statistics...")
-        flat_params = jax.tree_util.tree_leaves(state.params)
-        flat_paths = jax.tree_util.tree_paths(state.params)
+        flat_paths, flat_params = jax.tree_util.tree_leaves_with_path(state.params)
         
         for path, param in zip(flat_paths, flat_params):
             param_name = '/'.join(str(p) for p in path)
