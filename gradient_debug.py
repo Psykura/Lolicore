@@ -54,19 +54,19 @@ def log_tensor_stats(tensor, name, step):
     """Log detailed statistics about a tensor."""
     if tensor is None:
         return {
-            'mean': 0.0,
-            'std': 0.0,
-            'min': 0.0,
-            'max': 0.0,
-            'has_nan': False,
-            'has_inf': False
+            'mean': jnp.array(0.0),
+            'std': jnp.array(0.0),
+            'min': jnp.array(0.0),
+            'max': jnp.array(0.0),
+            'has_nan': jnp.array(False),
+            'has_inf': jnp.array(False)
         }
     
     # Convert to float32 for stable computation
     if tensor.dtype != jnp.float32:
         tensor = tensor.astype(jnp.float32)
     
-    # Basic statistics
+    # Basic statistics - keep as JAX arrays
     mean = jnp.mean(tensor)
     std = jnp.std(tensor)
     min_val = jnp.min(tensor)
@@ -81,44 +81,44 @@ def log_tensor_stats(tensor, name, step):
         # For router probabilities/logits
         if 'prob' in name.lower() or 'weight' in name.lower():
             entropy = -jnp.sum(tensor * jnp.log(tensor + 1e-5), axis=-1)
-            mean_entropy = float(jnp.mean(entropy))
-            max_prob = float(jnp.max(tensor))
-            sparsity = float(jnp.mean(tensor < 1e-5))
+            mean_entropy = jnp.mean(entropy)
+            max_prob = jnp.max(tensor)
+            sparsity = jnp.mean(tensor < 1e-5)
             
             return {
-                'mean': float(mean),
-                'std': float(std),
-                'min': float(min_val),
-                'max': float(max_val),
-                'has_nan': bool(has_nan),
-                'has_inf': bool(has_inf),
+                'mean': mean,
+                'std': std,
+                'min': min_val,
+                'max': max_val,
+                'has_nan': has_nan,
+                'has_inf': has_inf,
                 'entropy': mean_entropy,
                 'max_prob': max_prob,
                 'sparsity': sparsity
             }
         # For expert masks
         elif 'mask' in name.lower():
-            active_experts = float(jnp.mean(jnp.sum(tensor, axis=0) > 0))
-            tokens_per_expert = float(jnp.mean(jnp.sum(tensor, axis=(1, 2))))
+            active_experts = jnp.mean(jnp.sum(tensor, axis=0) > 0)
+            tokens_per_expert = jnp.mean(jnp.sum(tensor, axis=(1, 2)))
             
             return {
-                'mean': float(mean),
-                'std': float(std),
-                'min': float(min_val),
-                'max': float(max_val),
-                'has_nan': bool(has_nan),
-                'has_inf': bool(has_inf),
+                'mean': mean,
+                'std': std,
+                'min': min_val,
+                'max': max_val,
+                'has_nan': has_nan,
+                'has_inf': has_inf,
                 'active_experts_ratio': active_experts,
                 'tokens_per_expert': tokens_per_expert
             }
     
     return {
-        'mean': float(mean),
-        'std': float(std),
-        'min': float(min_val),
-        'max': float(max_val),
-        'has_nan': bool(has_nan),
-        'has_inf': bool(has_inf)
+        'mean': mean,
+        'std': std,
+        'min': min_val,
+        'max': max_val,
+        'has_nan': has_nan,
+        'has_inf': has_inf
     }
 
 def print_stats(stats, name):
@@ -160,11 +160,11 @@ def log_activation_flow(model_outputs, step):
     if isinstance(router_loss, (tuple, list)):
         # If router_loss contains multiple components
         activation_stats['router_loss'] = {
-            'total': float(sum(router_loss)),
-            'components': [float(x) for x in router_loss]
+            'total': jnp.sum(jnp.array(router_loss)),
+            'components': jnp.array(router_loss)
         }
     else:
-        activation_stats['router_loss'] = float(router_loss)
+        activation_stats['router_loss'] = router_loss
     
     return activation_stats
 
