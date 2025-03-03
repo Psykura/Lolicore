@@ -288,14 +288,14 @@ class Router(nn.Module):
             flat_probs,
             ((0, 0), (0, padding_width)),
             mode='constant',
-            constant_values=-1e9
+            constant_values=-1e4  # Use a smaller negative value to avoid numerical issues
         )
         
         # Select top tokens for each expert, now safe since input is padded
         scores, token_indices = jax.lax.top_k(flat_probs, k=expert_capacity)
         
-        # Zero out scores for padded values
-        scores = jnp.where(scores > -1e8, scores, 0.0)
+        # Zero out scores for padded values - use a less extreme threshold
+        scores = jnp.where(scores > -1e3, scores, 0.0)
         
         # Convert flat indices to (group, position) coordinates
         group_indices = token_indices // group_size
@@ -556,6 +556,10 @@ class ExpertsFeedForward(nn.Module):
         # Compute group size and reshape input
         group_size, num_groups = self._compute_group_size(batch_size, seq_len)
         
+        # Ensure group_size is at least 1
+        group_size = max(1, group_size)
+        num_groups = max(1, num_groups)
+        
         # Reshape with explicit handling of remainder
         if batch_size * seq_len == num_groups * group_size:
             # Perfect division case
@@ -572,12 +576,22 @@ class ExpertsFeedForward(nn.Module):
             x_grouped = x_padded.reshape(num_groups, group_size, self.d_model)
         
         # Calculate expert capacity with a minimum based on group size
-        expert_capacity = max(
-            int(round(self.expert_capacity_factor * group_size / self.num_experts)),
-            self.min_expert_capacity,
-            # Ensure at least 1% of tokens per expert to avoid too small batches
-            max(1, group_size // 100)
-        )
+        # Ensure we don't divide by zero
+        safe_num_experts = max(1, self.num_experts)
+        
+        # Calculate capacity with safeguards
+        capacity_from_factor = int(round(self.expert_capacity_factor * group_size / safe_num_experts))
+        min_capacity = self.min_expert_capacity
+        min_percentage = max(1, group_size // 100)
+        
+        # Ensure all values are positive
+        capacity_from_factor = max(1, capacity_from_factor)
+        min_capacity = max(1, min_capacity)
+        
+        expert_capacity = max(capacity_from_factor, min_capacity, min_percentage)
+        
+        # Add a debug print to track expert capacity
+        jax.debug.print('expert_capacity: {capacity}', capacity=expert_capacity)
         
         # Get routing assignments from router
         if self.training:
