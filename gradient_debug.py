@@ -37,12 +37,12 @@ DTYPE = jnp.bfloat16  # Match your model's dtype
 
 def create_dummy_batch(batch_size=DEBUG_BATCH_SIZE, seq_length=DEBUG_SEQ_LENGTH):
     """Create a dummy batch for testing."""
-    # Create random input IDs
-    input_ids = jnp.ones((batch_size, seq_length), dtype=jnp.int32)
+    # Create random input IDs with values between 1 and 10
+    input_ids = jnp.array(np.random.randint(1, 11, size=(batch_size, seq_length)), dtype=jnp.int32)
     # Create attention mask (all 1s for simplicity)
     attention_mask = jnp.ones((batch_size, seq_length), dtype=jnp.int32)
     # Create labels (shifted input_ids)
-    labels = jnp.ones((batch_size, seq_length), dtype=jnp.int32)
+    labels = jnp.array(np.random.randint(1, 11, size=(batch_size, seq_length)), dtype=jnp.int32)
     
     return {
         'input_ids': input_ids,
