@@ -91,8 +91,7 @@ def log_gradient_flow(grads, step):
     grad_stats = {}
     
     # Flatten the nested dictionary structure
-    flat_grads = jax.tree_util.tree_leaves(grads)
-    flat_paths = jax.tree_util.tree_paths(grads)
+    flat_paths, flat_grads = jax.tree_util.tree_leaves_with_path(grads)
     
     for path, grad in zip(flat_paths, flat_grads):
         param_name = '/'.join(str(p) for p in path)
