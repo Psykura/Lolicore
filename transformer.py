@@ -152,23 +152,25 @@ class MultiHeadAttention(nn.Module):
         # Original: scores = jnp.matmul(q, k.transpose(0, 1, 3, 2)) / scale
         scores = jnp.einsum('bnqd,bnkd->bnqk', q, k) / scale
 
+        # Apply softmax first
+        attn_weights = nn.softmax(scores, axis=-1)
+
         # MEMORY OPTIMIZATION: Apply masking directly without materializing full masks
         
         # Create a function to apply causal mask without materializing the full mask
-        def apply_causal_mask(attn_scores):
+        def apply_causal_mask(weights):
             # Create row and column indices for broadcasting
             row_idx = jnp.arange(seq_len)[None, :]  # [1, seq_len]
             col_idx = jnp.arange(seq_len)[:, None]  # [seq_len, 1]
             
-            # Apply causal mask using arithmetic comparison (much more memory efficient)
-            # This creates a mask where row_idx >= col_idx (lower triangular)
+            # Create causal mask (lower triangular)
             causal_mask = row_idx >= col_idx
             
-            # Apply the mask to attention scores
-            return jnp.where(causal_mask, attn_scores, -jnp.inf)
+            # Apply the mask to attention weights
+            return jnp.where(causal_mask, weights, 0.0)
         
-        # Apply causal masking to scores
-        scores = jax.vmap(jax.vmap(apply_causal_mask))(scores)
+        # Apply causal masking to attention weights
+        attn_weights = jax.vmap(jax.vmap(apply_causal_mask))(attn_weights)
         
         # Apply attention mask if provided
         if attn_mask is not None and attn_mask.ndim == 2 and attn_mask.shape[0] == batch_size:
@@ -179,13 +181,8 @@ class MultiHeadAttention(nn.Module):
             # Reshape for broadcasting: [batch_size, 1, seq_len, 1]
             attn_mask_4d = attn_mask[:, None, :, None]
             
-            # Apply attention mask to scores
-            # This masks out padding tokens in a memory-efficient way
-            scores = jnp.where(attn_mask_4d > 0, scores, float('-inf'))
-
-        # Apply softmax to get attention weights
-        attn_weights = nn.softmax(scores, axis=-1)
-        attn_weights = jnp.where(jnp.isnan(attn_weights), 0.0, attn_weights)
+            # Apply the mask to attention weights
+            attn_weights = jnp.where(attn_mask_4d > 0, attn_weights, 0.0)
 
         # Apply attention weights to values using einsum instead of matmul
         # Original: attended = jnp.matmul(attn_weights, v)
