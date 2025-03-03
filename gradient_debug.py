@@ -18,6 +18,8 @@ from typing import Dict, Tuple, List, Any
 import pickle
 import time
 from transformers import AutoTokenizer
+jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_debug_nans", True)
 
 # Import your model and training utilities
 # Adjust these imports based on your project structure
