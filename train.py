@@ -60,8 +60,8 @@ MODEL_CONFIG = {
 
 # Dataset configuration
 DATASET_CONFIG = {
-    'path': 'HuggingFaceFW/fineweb',
-    'name': 'sample-10BT',
+    'path': "wikitext", #'HuggingFaceFW/fineweb',
+    'name': "wikitext-103-v1", #'sample-10BT',
     'split': 'train',
 }
 
