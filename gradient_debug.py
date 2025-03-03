@@ -206,7 +206,6 @@ def debug_train_step(state, batch, rngs, step):
         loss_mask_stats = log_tensor_stats(loss_mask, "loss_mask", step)
         
         # Clip logits to prevent extreme values
-        shift_logits = jnp.clip(shift_logits, -100.0, 100.0)
         clipped_logits_stats = log_tensor_stats(shift_logits, "clipped_logits", step)
         
         # Convert labels to one-hot encoding
@@ -225,7 +224,6 @@ def debug_train_step(state, batch, rngs, step):
         main_loss_stats = log_tensor_stats(jnp.array([main_loss]), "main_loss_scalar", step)
         
         # Clip router loss
-        router_loss = jnp.clip(router_loss, -100.0, 100.0)
         router_loss_stats = log_tensor_stats(jnp.array([router_loss]), "router_loss_scalar", step)
         
         # Combine losses
@@ -233,7 +231,6 @@ def debug_train_step(state, batch, rngs, step):
         total_loss_stats = log_tensor_stats(jnp.array([total_loss]), "total_loss", step)
         
         # Check for NaN and replace with zero
-        total_loss = jnp.where(jnp.isnan(total_loss), 0.0, total_loss)
         final_loss_stats = log_tensor_stats(jnp.array([total_loss]), "final_loss", step)
         
         all_stats = {
@@ -256,11 +253,7 @@ def debug_train_step(state, batch, rngs, step):
     
     # Log gradient statistics
     grad_stats, problematic_params = log_gradient_flow(grads, step)
-    
-    # Replace NaN gradients with zeros
-    grads = jax.tree_map(lambda g: jnp.where(jnp.isnan(g), 0.0, g), grads)
-    
-    # Update model
+        # Update model
     new_state = state.apply_gradients(grads=grads)
     
     metrics = {
