@@ -177,6 +177,7 @@ def check_param_spec_consistency(path, param, sharding):
     spec = sharding.spec
     spec_ndim = sum(1 for axis in spec if axis is not None)
     if spec_ndim != param.ndim:
+        path = '/'.join(str(p) for p in path)
         print(f"Inconsistent parameter: {path}")
         print(f"  Shape: {param.shape} (ndim={param.ndim})")
         print(f"  Spec: {spec} (effective ndim={spec_ndim})")
