@@ -502,28 +502,6 @@ def run_gradient_debug():
         else:
             print("No issues found in initial parameters")
         
-        # Debug specific modules
-        print("\nDebugging specific modules...")
-        router = Router(
-            d_model=MODEL_CONFIG['d_model'],
-            num_experts=MODEL_CONFIG['num_experts'],
-            dtype=DTYPE,
-            training=True
-        )
-        debug_router_module(router)
-        
-        moe_layer = ExpertsFeedForward(
-            d_model=MODEL_CONFIG['d_model'],
-            hidden_size=MODEL_CONFIG['hidden_size'],
-            num_experts=MODEL_CONFIG['num_experts'],
-            num_shared_experts=MODEL_CONFIG['num_shared_experts'],
-            num_constant_experts=MODEL_CONFIG.get('num_constant_experts', 0),
-            num_noise_experts=MODEL_CONFIG.get('num_noise_experts', 0),
-            dtype=DTYPE,
-            training=True
-        )
-        debug_experts_feedforward(moe_layer)
-        
         # Run debug training steps
         print("\nRunning debug training steps...")
         for step in range(DEBUG_STEPS):
