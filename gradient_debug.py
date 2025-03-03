@@ -52,29 +52,33 @@ def create_dummy_batch(batch_size=DEBUG_BATCH_SIZE, seq_length=DEBUG_SEQ_LENGTH)
 
 def log_tensor_stats(tensor, name, step):
     """Check statistics about a tensor to identify numerical issues."""
-    # Convert to numpy for easier handling
-    if hasattr(tensor, 'device_buffer'):
-        tensor = np.array(tensor)
-    
-    # Basic statistics
+    # Keep everything as JAX arrays to work within JIT
     stats = {
-        'min': float(np.min(tensor)),
-        'max': float(np.max(tensor)),
-        'mean': float(np.mean(tensor)),
-        'std': float(np.std(tensor)),
-        'has_nan': bool(np.isnan(np.sum(tensor))),
-        'has_inf': bool(np.isinf(np.sum(tensor))),
+        'min': jnp.min(tensor),
+        'max': jnp.max(tensor),
+        'mean': jnp.mean(tensor),
+        'std': jnp.std(tensor),
+        'has_nan': jnp.any(jnp.isnan(tensor)),
+        'has_inf': jnp.any(jnp.isinf(tensor)),
     }
     
     # Count NaNs and Infs
     if stats['has_nan'] or stats['has_inf']:
-        stats['nan_count'] = int(np.sum(np.isnan(tensor)))
-        stats['inf_count'] = int(np.sum(np.isinf(tensor)))
+        stats['nan_count'] = jnp.sum(jnp.isnan(tensor))
+        stats['inf_count'] = jnp.sum(jnp.isinf(tensor))
         stats['total_elements'] = tensor.size
         stats['nan_percentage'] = stats['nan_count'] / stats['total_elements'] * 100
         stats['inf_percentage'] = stats['inf_count'] / stats['total_elements'] * 100
     
     return stats
+
+def print_stats(stats, name):
+    """Helper function to print statistics after computation."""
+    print(f"Stats for {name}:")
+    for k, v in stats.items():
+        if isinstance(v, (jax.Array, jnp.ndarray)):
+            v = float(v)
+        print(f"  {k}: {v}")
 
 def log_gradient_flow(grads, step):
     """Check gradient statistics for each parameter."""
@@ -90,7 +94,7 @@ def log_gradient_flow(grads, step):
     # Identify parameters with NaN or Inf gradients
     problematic_params = {
         name: stats for name, stats in grad_stats.items() 
-        if stats.get('has_nan', False) or stats.get('has_inf', False)
+        if stats['has_nan'] or stats['has_inf']
     }
     
     return grad_stats, problematic_params
@@ -138,41 +142,53 @@ def debug_train_step(state, batch, rngs, step):
         shift_logits = shift_logits.astype(jnp.float32)
         
         # Log intermediate values
-        log_tensor_stats(shift_logits, "shift_logits", step)
-        log_tensor_stats(loss_mask, "loss_mask", step)
+        shift_logits_stats = log_tensor_stats(shift_logits, "shift_logits", step)
+        loss_mask_stats = log_tensor_stats(loss_mask, "loss_mask", step)
         
         # Clip logits to prevent extreme values
         shift_logits = jnp.clip(shift_logits, -100.0, 100.0)
-        log_tensor_stats(shift_logits, "clipped_logits", step)
+        clipped_logits_stats = log_tensor_stats(shift_logits, "clipped_logits", step)
         
         # Convert labels to one-hot encoding
         shift_labels_one_hot = jax.nn.one_hot(shift_labels, num_classes=logits.shape[-1])
         
         # Calculate cross entropy
         main_loss = optax.softmax_cross_entropy(shift_logits, shift_labels_one_hot)
-        log_tensor_stats(main_loss, "cross_entropy_raw", step)
+        cross_entropy_stats = log_tensor_stats(main_loss, "cross_entropy_raw", step)
         
         # Apply loss masking
         main_loss = main_loss * loss_mask
-        log_tensor_stats(main_loss, "masked_loss", step)
+        masked_loss_stats = log_tensor_stats(main_loss, "masked_loss", step)
         
         # Calculate mean loss
         main_loss = jnp.sum(main_loss) / (jnp.sum(loss_mask) + 1e-5)
-        log_tensor_stats(jnp.array([main_loss]), "main_loss_scalar", step)
+        main_loss_stats = log_tensor_stats(jnp.array([main_loss]), "main_loss_scalar", step)
         
         # Clip router loss
         router_loss = jnp.clip(router_loss, -100.0, 100.0)
-        log_tensor_stats(jnp.array([router_loss]), "router_loss_scalar", step)
+        router_loss_stats = log_tensor_stats(jnp.array([router_loss]), "router_loss_scalar", step)
         
         # Combine losses
         total_loss = main_loss + router_loss
-        log_tensor_stats(jnp.array([total_loss]), "total_loss", step)
+        total_loss_stats = log_tensor_stats(jnp.array([total_loss]), "total_loss", step)
         
         # Check for NaN and replace with zero
         total_loss = jnp.where(jnp.isnan(total_loss), 0.0, total_loss)
-        log_tensor_stats(jnp.array([total_loss]), "final_loss", step)
+        final_loss_stats = log_tensor_stats(jnp.array([total_loss]), "final_loss", step)
         
-        return total_loss, (main_loss, router_loss, activation_stats)
+        all_stats = {
+            'shift_logits': shift_logits_stats,
+            'loss_mask': loss_mask_stats,
+            'clipped_logits': clipped_logits_stats,
+            'cross_entropy': cross_entropy_stats,
+            'masked_loss': masked_loss_stats,
+            'main_loss': main_loss_stats,
+            'router_loss': router_loss_stats,
+            'total_loss': total_loss_stats,
+            'final_loss': final_loss_stats
+        }
+        
+        return total_loss, (main_loss, router_loss, activation_stats, all_stats)
     
     # Get gradients
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -180,9 +196,6 @@ def debug_train_step(state, batch, rngs, step):
     
     # Log gradient statistics
     grad_stats, problematic_params = log_gradient_flow(grads, step)
-    
-    # Visualize gradient distribution
-    visualize_gradient_distribution(grad_stats, step)
     
     # Replace NaN gradients with zeros
     grads = jax.tree_map(lambda g: jnp.where(jnp.isnan(g), 0.0, g), grads)
@@ -195,9 +208,15 @@ def debug_train_step(state, batch, rngs, step):
         'main_loss': aux[0],
         'router_loss': aux[1],
         'activation_stats': aux[2],
+        'computation_stats': aux[3],
         'grad_stats': grad_stats,
         'problematic_params': problematic_params
     }
+    
+    # Print statistics after computation
+    print("\nStep Statistics:")
+    for name, stats in metrics['computation_stats'].items():
+        print_stats(stats, name)
     
     return new_state, metrics
 
