@@ -427,10 +427,7 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
         
         # Cast to float32 for loss calculation for better numerical stability
         shift_logits = shift_logits.astype(jnp.float32)
-        
-        # Clip logits to prevent extreme values
-        shift_logits = jnp.clip(shift_logits, -100.0, 100.0)
-        
+                
         # Convert labels to one-hot encoding for cross entropy
         shift_labels_one_hot = jax.nn.one_hot(shift_labels, num_classes=logits.shape[-1])
         
@@ -440,28 +437,17 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
             shift_labels_one_hot
         )
         
-        # Apply loss masking
         main_loss = main_loss * loss_mask
         
-        # Use a larger epsilon for numerical stability
         main_loss = jnp.sum(main_loss) / (jnp.sum(loss_mask) + 1e-5)
-        
-        # Clip router loss to prevent extreme values
-        router_loss = jnp.clip(router_loss, -100.0, 100.0)
         
         # Combine losses
         total_loss = main_loss + router_loss
-        
-        # Check for NaN and replace with zero to prevent propagation
-        total_loss = jnp.where(jnp.isnan(total_loss), 0.0, total_loss)
 
         return total_loss, (main_loss, router_loss)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (total_loss, aux), grads = grad_fn(state.params)
-    
-    # Replace NaN gradients with zeros
-    grads = jax.tree_map(lambda g: jnp.where(jnp.isnan(g), 0.0, g), grads)
 
     # Update model
     new_state = state.apply_gradients(grads=grads)
