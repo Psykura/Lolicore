@@ -28,7 +28,7 @@ import itertools
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
 
 # Constants
-CONTEXT_LENGTH = 2048
+CONTEXT_LENGTH = 256
 BATCH_SIZE = 8
 NUM_EPOCHS = 5
 LEARNING_RATE = 1e-5
@@ -44,7 +44,7 @@ vocab_size = ((vocab_size + 127) // 128) * 128
 
 # Model hyperparameters
 MODEL_CONFIG = {
-    'num_blocks': 12,
+    'num_blocks': 6,
     'num_heads': 8,
     'd_model': 512,
     'hidden_size': 4096,
@@ -53,7 +53,7 @@ MODEL_CONFIG = {
     'num_experts': 16,
     'num_shared_experts': 1,
     'use_gradient_checkpointing': True,
-    'attention_latent_dim': 48,
+    'attention_latent_dim': 64,
     'num_constant_experts': 4,
     'num_noise_experts': 1,
 }
@@ -420,7 +420,8 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
             rngs={'noise': noise_rng}
         )
 
-        # Calculate main loss using stable cross entropy with float32 precision
+        # Add loss masking using attention_mask
+        loss_mask = batch['attention_mask'][..., 1:]  # Use shifted mask
         shift_logits = logits[..., :-1, :]
         shift_labels = batch['labels'][..., 1:]
         # Cast to float32 for loss calculation
@@ -431,6 +432,9 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
         main_loss = jnp.mean(optax.safe_softmax_cross_entropy(shift_logits, shift_labels_one_hot))
         # Cast router loss to float32 as well for consistency
         router_loss = router_loss.astype(jnp.float32)
+        # Mask and normalize
+        masked_loss = main_loss * loss_mask
+        main_loss = jnp.sum(masked_loss) / jnp.maximum(jnp.sum(loss_mask), 1.0)
 
         total_loss = main_loss + router_loss
 

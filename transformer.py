@@ -270,7 +270,7 @@ class Router(nn.Module):
             
             # Calculate router z-loss to stabilize routing probabilities
             # Penalizes large values in the routing logits
-            router_z = jnp.log(jnp.sum(jnp.exp(router_logits), axis=-1))
+            router_z = jax.nn.logsumexp(router_logits, axis=-1)
             router_z_loss = jnp.mean(jnp.square(router_z)) * self.z_loss_coef
             
             # Combined loss
