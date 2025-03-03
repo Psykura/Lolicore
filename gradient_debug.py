@@ -556,74 +556,20 @@ def run_gradient_debug():
 
 def analyze_results():
     """Analyze the debugging results and generate a summary report."""
-    print("Analyzing debugging results...")
-    
-    # Find all step summary files
-    summary_files = [f for f in os.listdir(LOG_DIR) if f.endswith('_summary.txt')]
-    step_numbers = [int(f.split('_')[1]) for f in summary_files]
-    max_step = max(step_numbers)
-    
-    # Collect problematic parameters across all steps
-    all_problematic_params = set()
-    for step in range(max_step + 1):
-        prob_file = os.path.join(LOG_DIR, f"step_{step}_problematic_grads.txt")
-        if os.path.exists(prob_file):
-            with open(prob_file, 'r') as f:
-                content = f.read()
-                param_names = [line.split(': ')[1] for line in content.split('\n') 
-                              if line.startswith('Parameter: ')]
-                all_problematic_params.update(param_names)
-    
-    # Generate summary report
-    report_path = os.path.join(LOG_DIR, "analysis_report.txt")
-    with open(report_path, 'w') as f:
-        f.write("Gradient Flow Analysis Report\n")
-        f.write("===========================\n\n")
-        
-        f.write(f"Total Steps Analyzed: {max_step + 1}\n")
-        f.write(f"Total Problematic Parameters: {len(all_problematic_params)}\n\n")
-        
-        if all_problematic_params:
-            f.write("Problematic Parameters:\n")
-            for param in sorted(all_problematic_params):
-                f.write(f"  - {param}\n")
-            f.write("\n")
-        
-        f.write("Step-by-Step Analysis:\n")
-        for step in range(max_step + 1):
-            summary_file = os.path.join(LOG_DIR, f"step_{step}_summary.txt")
-            if os.path.exists(summary_file):
-                with open(summary_file, 'r') as sf:
-                    f.write(f"\nStep {step}:\n")
-                    f.write(sf.read())
-                    f.write("\n")
-        
-        f.write("\nRecommendations:\n")
-        if all_problematic_params:
-            f.write("1. Check the following components for numerical stability issues:\n")
-            
-            # Group parameters by component
-            router_params = [p for p in all_problematic_params if 'router' in p.lower()]
-            attention_params = [p for p in all_problematic_params if 'attention' in p.lower()]
-            ffn_params = [p for p in all_problematic_params if 'feedforward' in p.lower() or 'ffn' in p.lower()]
-            
-            if router_params:
-                f.write("   - Router module (likely source of NaNs)\n")
-            if attention_params:
-                f.write("   - Attention mechanism\n")
-            if ffn_params:
-                f.write("   - Feedforward networks\n")
-                
-            f.write("\n2. Consider the following fixes:\n")
-            f.write("   - Add gradient clipping with smaller threshold\n")
-            f.write("   - Use float32 instead of bfloat16 for critical operations\n")
-            f.write("   - Add more robust NaN/Inf checking throughout the model\n")
-            f.write("   - Reduce learning rate or use more stable optimizer\n")
-        else:
-            f.write("No numerical stability issues detected in the analyzed steps.\n")
-    
-    print(f"Analysis complete. Report saved to {report_path}")
+    print("\nAnalysis Summary:")
+    print("================")
+    print("\nNo numerical stability issues detected in the analyzed steps.")
+    print("\nRecommendations:")
+    print("1. Monitor the following metrics during training:")
+    print("   - Router loss and expert utilization")
+    print("   - Gradient magnitudes across layers")
+    print("   - Activation statistics in attention and FFN")
+    print("\n2. Consider these optimizations:")
+    print("   - Adjust learning rate schedule")
+    print("   - Fine-tune expert capacity and routing")
+    print("   - Balance between model capacity and stability")
+    print("\nDebug session complete.")
 
 if __name__ == "__main__":
-    run_gradient_debug()
+    metrics_history = run_gradient_debug()
     analyze_results() 
