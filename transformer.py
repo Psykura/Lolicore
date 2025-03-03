@@ -470,7 +470,6 @@ class ExpertsFeedForward(nn.Module):
             # Recalculate for exact division
             group_size = num_tokens // num_groups
         
-        jax.debug.print('group_size: {group_size}, num_groups: {num_groups}', group_size=group_size, num_groups=num_groups)
         return group_size, num_groups
 
     def _process_shared_experts(self, x):
@@ -589,9 +588,6 @@ class ExpertsFeedForward(nn.Module):
         min_capacity = max(1, min_capacity)
         
         expert_capacity = max(capacity_from_factor, min_capacity, min_percentage)
-        
-        # Add a debug print to track expert capacity
-        jax.debug.print('expert_capacity: {capacity}', capacity=expert_capacity)
         
         # Get routing assignments from router
         if self.training:

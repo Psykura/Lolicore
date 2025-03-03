@@ -224,111 +224,174 @@ def debug_router_module(router, batch_size=DEBUG_BATCH_SIZE, seq_length=DEBUG_SE
     """Specifically debug the Router module to identify numerical issues."""
     print("Debugging Router module...")
     
-    # Create a dummy input for the router
+    # Create a dummy input for the router with more varied data
     num_groups = 2
     group_size = (batch_size * seq_length) // num_groups
     d_model = MODEL_CONFIG['d_model']
     
-    # Create random input
+    # Create random input with different patterns
     key = jax.random.PRNGKey(0)
-    x = jax.random.normal(key, (num_groups, group_size, d_model))
+    keys = jax.random.split(key, 3)
+    
+    # Create three different patterns in the input
+    x1 = jax.random.normal(keys[0], (num_groups, group_size, d_model))
+    x2 = jax.random.uniform(keys[1], (num_groups, group_size, d_model))
+    x3 = jnp.zeros((num_groups, group_size, d_model)).at[0, :, :].set(
+        jax.random.normal(keys[2], (group_size, d_model))
+    )
+    
+    # Mix the patterns
+    mix_ratio = jnp.array([0.6, 0.3, 0.1])
+    x = (x1 * mix_ratio[0] + x2 * mix_ratio[1] + x3 * mix_ratio[2])
     
     # Convert to bfloat16 if needed
     if router.dtype == jnp.bfloat16:
         x = x.astype(jnp.bfloat16)
     
-    # Initialize router
-    params = router.init(jax.random.PRNGKey(1), x, expert_capacity=4)
+    # Initialize router with different random key
+    params = router.init(jax.random.PRNGKey(42), x, expert_capacity=4)
     
     # Test with different expert capacities
     capacities = [1, 4, 8, 16, 32]
     
     for capacity in capacities:
-        print(f"Testing with expert_capacity={capacity}")
+        print(f"\nTesting with expert_capacity={capacity}")
+        print(f"Input shape: {x.shape}, dtype: {x.dtype}")
         
         # Run router in training mode
         router.training = True
         try:
-            expert_masks, weight_masks, loss = router.apply(
-                params, x, expert_capacity=capacity, use_mask_routing=True
-            )
-            
-            # Log statistics
-            log_tensor_stats(expert_masks, f"router_expert_masks_cap{capacity}", 0)
-            log_tensor_stats(weight_masks, f"router_weight_masks_cap{capacity}", 0)
-            log_tensor_stats(jnp.array([loss]), f"router_loss_cap{capacity}", 0)
-            
-            print(f"  Training mode successful. Loss: {loss}")
+            # Test with different noise keys to ensure routing varies
+            for i in range(3):
+                noise_key = jax.random.PRNGKey(i)
+                expert_masks, weight_masks, loss = router.apply(
+                    params, x, expert_capacity=capacity, use_mask_routing=True,
+                    rngs={'noise': noise_key}
+                )
+                
+                # Log statistics
+                expert_stats = log_tensor_stats(expert_masks, f"router_expert_masks_cap{capacity}", i)
+                weight_stats = log_tensor_stats(weight_masks, f"router_weight_masks_cap{capacity}", i)
+                loss_stats = log_tensor_stats(jnp.array([loss]), f"router_loss_cap{capacity}", i)
+                
+                print(f"  Training iteration {i+1}:")
+                print(f"    Loss: {float(loss)}")
+                print(f"    Expert mask stats - mean: {float(expert_stats['mean']):.4f}, std: {float(expert_stats['std']):.4f}")
+                print(f"    Weight mask stats - mean: {float(weight_stats['mean']):.4f}, std: {float(weight_stats['std']):.4f}")
         except Exception as e:
             print(f"  Error in training mode: {e}")
         
         # Run router in inference mode
         router.training = False
         try:
-            indices, scores, loss = router.apply(
-                params, x, expert_capacity=capacity
-            )
-            
-            # Log statistics
-            log_tensor_stats(indices, f"router_indices_cap{capacity}", 0)
-            log_tensor_stats(scores, f"router_scores_cap{capacity}", 0)
-            log_tensor_stats(jnp.array([loss]), f"router_loss_inference_cap{capacity}", 0)
-            
-            print(f"  Inference mode successful.")
+            # Test inference with different inputs
+            for i in range(2):
+                test_key = jax.random.PRNGKey(i + 100)
+                test_input = jax.random.normal(test_key, (num_groups, group_size, d_model))
+                if router.dtype == jnp.bfloat16:
+                    test_input = test_input.astype(jnp.bfloat16)
+                
+                indices, scores, loss = router.apply(
+                    params, test_input, expert_capacity=capacity
+                )
+                
+                # Log statistics
+                indices_stats = log_tensor_stats(indices, f"router_indices_cap{capacity}", i)
+                scores_stats = log_tensor_stats(scores, f"router_scores_cap{capacity}", i)
+                loss_stats = log_tensor_stats(jnp.array([loss]), f"router_loss_inference_cap{capacity}", i)
+                
+                print(f"  Inference test {i+1}:")
+                print(f"    Loss: {float(loss)}")
+                print(f"    Scores stats - mean: {float(scores_stats['mean']):.4f}, std: {float(scores_stats['std']):.4f}")
+                print(f"    Unique expert assignments: {len(jnp.unique(indices))}")
         except Exception as e:
             print(f"  Error in inference mode: {e}")
     
-    print("Router debugging complete.")
+    print("\nRouter debugging complete.")
 
 def debug_experts_feedforward(moe_layer, batch_size=DEBUG_BATCH_SIZE, seq_length=DEBUG_SEQ_LENGTH):
     """Specifically debug the ExpertsFeedForward module to identify numerical issues."""
-    print("Debugging ExpertsFeedForward module...")
+    print("\nDebugging ExpertsFeedForward module...")
     
-    # Create a dummy input
+    # Create varied test inputs
     d_model = MODEL_CONFIG['d_model']
     
-    # Create random input
-    key = jax.random.PRNGKey(0)
-    x = jax.random.normal(key, (batch_size, seq_length, d_model))
-    
-    # Convert to bfloat16 if needed
-    if moe_layer.dtype == jnp.bfloat16:
-        x = x.astype(jnp.bfloat16)
-    
-    # Initialize MoE layer
-    params = moe_layer.init(jax.random.PRNGKey(1), x)
-    
-    # Test in training mode
-    moe_layer.training = True
-    try:
-        output, loss = moe_layer.apply(
-            params, x, rngs={'noise': jax.random.PRNGKey(2)}
-        )
+    def create_test_input(key, pattern="normal"):
+        if pattern == "normal":
+            x = jax.random.normal(key, (batch_size, seq_length, d_model))
+        elif pattern == "uniform":
+            x = jax.random.uniform(key, (batch_size, seq_length, d_model))
+        elif pattern == "sparse":
+            x = jnp.zeros((batch_size, seq_length, d_model))
+            mask = jax.random.bernoulli(key, p=0.1, shape=(batch_size, seq_length, 1))
+            values = jax.random.normal(jax.random.split(key)[0], (batch_size, seq_length, d_model))
+            x = x + values * mask
         
-        # Log statistics
-        log_tensor_stats(output, "moe_output_training", 0)
-        log_tensor_stats(jnp.array([loss]), "moe_loss_training", 0)
-        
-        print(f"  Training mode successful. Loss: {loss}")
-    except Exception as e:
-        print(f"  Error in training mode: {e}")
+        if moe_layer.dtype == jnp.bfloat16:
+            x = x.astype(jnp.bfloat16)
+        return x
     
-    # Test in inference mode
-    moe_layer.training = False
-    try:
-        output, loss = moe_layer.apply(
-            params, x, rngs={'noise': jax.random.PRNGKey(3)}
-        )
-        
-        # Log statistics
-        log_tensor_stats(output, "moe_output_inference", 0)
-        log_tensor_stats(jnp.array([loss]), "moe_loss_inference", 0)
-        
-        print(f"  Inference mode successful.")
-    except Exception as e:
-        print(f"  Error in inference mode: {e}")
+    # Initialize MoE layer with different random key
+    key = jax.random.PRNGKey(42)
+    x_init = create_test_input(key)
+    params = moe_layer.init(key, x_init)
     
-    print("ExpertsFeedForward debugging complete.")
+    # Test different input patterns
+    patterns = ["normal", "uniform", "sparse"]
+    
+    for pattern in patterns:
+        print(f"\nTesting with {pattern} input distribution:")
+        
+        # Test in training mode
+        moe_layer.training = True
+        try:
+            for i in range(3):
+                test_key = jax.random.PRNGKey(i + 200)
+                x = create_test_input(test_key, pattern)
+                
+                output, loss = moe_layer.apply(
+                    params, x,
+                    rngs={'noise': jax.random.PRNGKey(i)}
+                )
+                
+                # Log statistics
+                output_stats = log_tensor_stats(output, f"moe_output_{pattern}_train", i)
+                loss_stats = log_tensor_stats(jnp.array([loss]), f"moe_loss_{pattern}_train", i)
+                
+                print(f"  Training iteration {i+1}:")
+                print(f"    Loss: {float(loss)}")
+                print(f"    Output stats - mean: {float(output_stats['mean']):.4f}, std: {float(output_stats['std']):.4f}")
+                
+                # Check if output maintains the input dimensionality
+                print(f"    Input shape: {x.shape}, Output shape: {output.shape}")
+                
+        except Exception as e:
+            print(f"  Error in training mode: {e}")
+        
+        # Test in inference mode
+        moe_layer.training = False
+        try:
+            for i in range(2):
+                test_key = jax.random.PRNGKey(i + 300)
+                x = create_test_input(test_key, pattern)
+                
+                output, loss = moe_layer.apply(
+                    params, x,
+                    rngs={'noise': jax.random.PRNGKey(i)}
+                )
+                
+                # Log statistics
+                output_stats = log_tensor_stats(output, f"moe_output_{pattern}_inference", i)
+                loss_stats = log_tensor_stats(jnp.array([loss]), f"moe_loss_{pattern}_inference", i)
+                
+                print(f"  Inference test {i+1}:")
+                print(f"    Loss: {float(loss)}")
+                print(f"    Output stats - mean: {float(output_stats['mean']):.4f}, std: {float(output_stats['std']):.4f}")
+                
+        except Exception as e:
+            print(f"  Error in inference mode: {e}")
+    
+    print("\nExpertsFeedForward debugging complete.")
 
 def run_gradient_debug():
     """Main function to run gradient debugging."""
