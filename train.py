@@ -427,7 +427,8 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
         shift_logits = shift_logits.astype(jnp.float32)
         # Convert labels to one-hot encoding for cross entropy
         shift_labels_one_hot = jax.nn.one_hot(shift_labels, num_classes=logits.shape[-1])
-        main_loss = optax.safe_softmax_cross_entropy(shift_logits, shift_labels_one_hot)
+        # Calculate cross entropy and reduce to scalar by taking mean
+        main_loss = jnp.mean(optax.safe_softmax_cross_entropy(shift_logits, shift_labels_one_hot))
         # Cast router loss to float32 as well for consistency
         router_loss = router_loss.astype(jnp.float32)
 
