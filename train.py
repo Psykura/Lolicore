@@ -74,9 +74,9 @@ def create_learning_rate_schedule(
     # Ensure warmup_steps is not larger than total steps
     warmup_steps = min(warmup_steps, num_train_steps)
 
-    # Create warmup schedule
+    # Create warmup schedule with higher initial learning rate
     warmup_fn = optax.linear_schedule(
-        init_value=0.0,
+        init_value=base_learning_rate * 0.1,  # Start at 10% of base lr
         end_value=base_learning_rate,
         transition_steps=warmup_steps
     )
@@ -84,10 +84,11 @@ def create_learning_rate_schedule(
     # Calculate remaining steps for cosine decay
     cosine_steps = max(num_train_steps - warmup_steps, 1)
 
-    # Create cosine decay schedule
+    # Create cosine decay schedule with minimum learning rate
     cosine_fn = optax.cosine_decay_schedule(
         init_value=base_learning_rate,
-        decay_steps=cosine_steps
+        decay_steps=cosine_steps,
+        alpha=0.1  # Don't let lr go to zero
     )
 
     # Combine schedules
@@ -173,16 +174,15 @@ def create_train_state(
         )
     print("CPU initialization complete")
 
-    # Create optimizer
+    # Create optimizer with improved settings
     optimizer = optax.chain(
         optax.clip_by_global_norm(GRADIENT_CLIP_NORM),
         optax.adamw(
             learning_rate=learning_rate_fn,
+            weight_decay=0.01,
             b1=0.9,
             b2=0.999,
             eps=1e-8,
-            weight_decay=0.001,
-            mu_dtype=jnp.float32,  # Use float32 for momentum
         )
     )
 
@@ -407,10 +407,9 @@ def create_batch(mesh, inputs):
             return examples
 
 @jax.jit
-def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rngs: jax.random.PRNGKey):
+def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], step: int, rngs: jax.random.PRNGKey):
     """Perform a single training step with model and data parallelism."""
-    #rngs, noise_rng = jax.random.split(rngs)
-    noise_rng = rngs
+    noise_rng = jax.random.fold_in(rngs, step)
 
     def loss_fn(params):
         logits, router_loss = state.apply_fn(
@@ -427,18 +426,15 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
         
         # Cast to float32 for loss calculation for better numerical stability
         shift_logits = shift_logits.astype(jnp.float32)
-                
-        # Convert labels to one-hot encoding for cross entropy
-        shift_labels_one_hot = jax.nn.one_hot(shift_labels, num_classes=logits.shape[-1])
-        
-        # Calculate cross entropy and reduce to scalar by taking mean
-        main_loss = optax.softmax_cross_entropy(
-            shift_logits, 
-            shift_labels_one_hot
+                        
+        # Calculate cross entropy with label smoothing
+        main_loss = optax.softmax_cross_entropy_with_integer_labels(
+            shift_logits,
+            shift_labels,
         )
         
+        # Apply loss masking and calculate mean
         main_loss = main_loss * loss_mask
-        
         main_loss = jnp.sum(main_loss) / (jnp.sum(loss_mask) + 1e-5)
         
         # Combine losses
@@ -757,7 +753,7 @@ def main():
                     batch = next(batch_iterator)
                     
                     # Train step with sharding
-                    state, metrics = train_step(state, batch, rngs=rng)
+                    state, metrics = train_step(state, batch, step, rngs=rng)
 
                     # Update progress bar and logging (existing code)
                     progress_bar.update(1)
