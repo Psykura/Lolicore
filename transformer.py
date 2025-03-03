@@ -165,7 +165,7 @@ class MultiHeadAttention(nn.Module):
             causal_mask = row_idx >= col_idx
             
             # Apply the mask to attention scores
-            return jnp.where(causal_mask, attn_scores, float('-inf'))
+            return jnp.where(causal_mask, attn_scores, -jnp.inf)
         
         # Apply causal masking to scores
         scores = jax.vmap(jax.vmap(apply_causal_mask))(scores)
@@ -230,7 +230,7 @@ class Router(nn.Module):
 
     def setup(self):
         # Gate network that produces logits for expert assignment
-        gate_init = nn.initializers.lecun_normal()
+        gate_init = nn.initializers.normal(stddev=0.02)
         self.gate = nn.Dense(
             features=self.num_experts,
             use_bias=False,
@@ -698,7 +698,11 @@ class Transformer(nn.Module):
         self.norm = nn.LayerNorm(dtype=self.dtype)
         
         # Output projection
-        self.output_proj = nn.Dense(features=self.vocab_size, dtype=self.dtype)
+        self.output_proj = nn.Dense(
+            features=self.vocab_size,
+            dtype=self.dtype,
+            kernel_init=nn.initializers.normal(stddev=0.02)
+        )
         
     def __call__(self, input_ids, attn_mask=None):
         # Get embeddings

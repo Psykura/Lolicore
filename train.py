@@ -406,50 +406,96 @@ def create_batch(mesh, inputs):
             # For non-array values, just pass through
             return examples
 
+def check_for_nans(tree, name=""):
+    """Check for NaNs in a PyTree structure."""
+    flat_tree = jax.tree_util.tree_leaves(tree)
+    for i, array in enumerate(flat_tree):
+        if jnp.isnan(array).any():
+            print(f"NaN detected in {name} at index {i}")
+            print(f"Shape: {array.shape}")
+            print(f"NaN count: {jnp.isnan(array).sum()}")
+            return True
+    return False
+
 @jax.jit
 def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rngs: jax.random.PRNGKey):
     """Perform a single training step with model and data parallelism."""
-    #rngs, noise_rng = jax.random.split(rngs)
-    noise_rng = rngs
+    noise_rng = jax.random.fold_in(rngs, state.step)
+    
+    # Check input batch for NaNs
+    check_for_nans(batch, "input batch")
+    
+    # Check model parameters for NaNs
+    check_for_nans(state.params, "model parameters")
 
     def loss_fn(params):
+        # Forward pass
         logits, router_loss = state.apply_fn(
             {'params': params},
             batch['input_ids'],
             batch['attention_mask'],
             rngs={'noise': noise_rng}
         )
-
+        
+        # Check outputs for NaNs
+        has_nan_logits = jnp.isnan(logits).any()
+        has_nan_router = jnp.isnan(router_loss).any()
+        
         # Add loss masking using attention_mask
-        loss_mask = batch['attention_mask'][..., 1:]  # Use shifted mask
+        loss_mask = batch['attention_mask'][..., :-1]
         shift_logits = logits[..., :-1, :]
         shift_labels = batch['labels'][..., 1:]
+        
         # Cast to float32 for loss calculation
         shift_logits = shift_logits.astype(jnp.float32)
+        
         # Convert labels to one-hot encoding for cross entropy
         shift_labels_one_hot = jax.nn.one_hot(shift_labels, num_classes=logits.shape[-1])
-        # Calculate cross entropy and reduce to scalar by taking mean
-        main_loss = jnp.mean(optax.safe_softmax_cross_entropy(shift_logits, shift_labels_one_hot))
-        # Cast router loss to float32 as well for consistency
-        router_loss = router_loss.astype(jnp.float32)
-        # Mask and normalize
-        masked_loss = main_loss * loss_mask
-        main_loss = jnp.sum(masked_loss) / jnp.maximum(jnp.sum(loss_mask), 1.0)
-
+        
+        # Calculate cross entropy with debugging
+        main_loss = optax.softmax_cross_entropy(
+            shift_logits, 
+            shift_labels_one_hot
+        )
+        
+        has_nan_ce = jnp.isnan(main_loss).any()
+        
+        main_loss = main_loss * loss_mask
+        main_loss = jnp.sum(main_loss) / (jnp.sum(loss_mask) + 1e-8)
+        
+        has_nan_final = jnp.isnan(main_loss).any()
+        
         total_loss = main_loss + router_loss
-
-        return total_loss, (main_loss, router_loss)
+        
+        # Return debugging info along with losses
+        debug_info = {
+            'has_nan_logits': has_nan_logits,
+            'has_nan_router': has_nan_router,
+            'has_nan_ce': has_nan_ce,
+            'has_nan_final': has_nan_final,
+            'max_logit': jnp.max(shift_logits),
+            'min_logit': jnp.min(shift_logits)
+        }
+        
+        return total_loss, (main_loss, router_loss, debug_info)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (total_loss, aux), grads = grad_fn(state.params)
-
+    
+    # Check gradients for NaNs
+    check_for_nans(grads, "gradients")
+    
+    # Extract debug info
+    main_loss, router_loss, debug_info = aux
+    
     # Update model
     new_state = state.apply_gradients(grads=grads)
 
     metrics = {
         'loss': total_loss,
-        'main_loss': aux[0],
-        'router_loss': aux[1]
+        'main_loss': main_loss,
+        'router_loss': router_loss,
+        **debug_info  # Include all debug info in metrics
     }
 
     return new_state, metrics
