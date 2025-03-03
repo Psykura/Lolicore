@@ -183,6 +183,7 @@ class MultiHeadAttention(nn.Module):
             # This masks out padding tokens in a memory-efficient way
             scores = jnp.where(attn_mask_4d > 0, scores, float('-inf'))
 
+        jax.debug.print("scores: {scores}", scores=scores)
         # Apply softmax to get attention weights
         attn_weights = nn.softmax(scores, axis=-1)
         
