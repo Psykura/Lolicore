@@ -39,8 +39,10 @@ def create_dummy_batch(batch_size=DEBUG_BATCH_SIZE, seq_length=DEBUG_SEQ_LENGTH)
     """Create a dummy batch for testing."""
     # Create random input IDs with values between 1 and 10
     input_ids = jnp.array(np.random.randint(1, 11, size=(batch_size, seq_length)), dtype=jnp.int32)
-    # Create attention mask (all 1s for simplicity)
+    # Create attention mask (half 1s, half 0s for more realistic testing)
     attention_mask = jnp.ones((batch_size, seq_length), dtype=jnp.int32)
+    # Set second half of each sequence to 0
+    attention_mask = attention_mask.at[:, seq_length//2:].set(0)
     # Create labels (shifted input_ids)
     labels = jnp.array(np.random.randint(1, 11, size=(batch_size, seq_length)), dtype=jnp.int32)
     
