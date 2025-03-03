@@ -91,9 +91,9 @@ def log_gradient_flow(grads, step):
     grad_stats = {}
     
     # Flatten the nested dictionary structure
-    flat_paths, flat_grads = jax.tree_util.tree_leaves_with_path(grads)
+    tree_leaves_with_path = jax.tree_util.tree_leaves_with_path(grads)
     
-    for path, grad in zip(flat_paths, flat_grads):
+    for path, grad in tree_leaves_with_path:
         param_name = '/'.join(str(p) for p in path)
         grad_stats[param_name] = log_tensor_stats(grad, f"grad_{param_name}", step)
     
@@ -384,9 +384,9 @@ def run_gradient_debug():
         
         # Log initial parameter statistics
         print("Logging initial parameter statistics...")
-        flat_paths, flat_params = jax.tree_util.tree_leaves_with_path(state.params)
+        tree_leaves_with_path = jax.tree_util.tree_leaves_with_path(state.params)
         
-        for path, param in zip(flat_paths, flat_params):
+        for path, param in tree_leaves_with_path:
             param_name = '/'.join(str(p) for p in path)
             log_tensor_stats(param, f"init_param_{param_name}", 0)
         
