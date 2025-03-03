@@ -519,7 +519,6 @@ def create_mesh():
     
     return mesh, n_devices
 
-# Update get_param_spec to handle 3D mesh with expert dimension
 def get_param_spec(param, path):
     """Get parameter sharding specification based on parameter path and shape."""
     path_str = str(path).lower()
@@ -528,51 +527,80 @@ def get_param_spec(param, path):
     mesh_axes = jax.devices().mesh_axes if hasattr(jax.devices(), 'mesh_axes') else None
     has_expert_dim = mesh_axes is not None and 'expert' in mesh_axes
     
-    # 1. Output projection and embedding layers - split across all dimensions
-    if 'output_proj' in path_str and 'kernel' in path_str:
-        return P('expert', 'model', 'batch') if has_expert_dim else P('model', 'batch')
+    # Handle 1D parameters (biases, scales, etc.)
+    if param.ndim == 1:
+        # For larger 1D parameters (>10k elements), shard across model dimension
+        if param.size > 10000:
+            return P('model')
+        # For smaller 1D parameters, replicate
+        return P(None)
+    
+    # Handle expert-related parameters
+    if 'experts' in path_str:
+        if has_expert_dim:
+            if 'keys' in path_str or 'values' in path_str:
+                if 'kernel' in path_str:
+                    return P('expert', 'model', None)
+                elif 'bias' in path_str:
+                    return P('expert', None, None)
+            elif 'jump' in path_str:
+                return P('expert', None, None)
+        else:
+            if 'kernel' in path_str:
+                return P('model', 'batch')
+            return P('model')
+    
+    # Router parameters
+    if 'router' in path_str:
+        if 'gate' in path_str:
+            if 'kernel' in path_str:
+                return P('expert', 'model', None) if has_expert_dim else P('model', None)
+            elif 'bias' in path_str:
+                return P('expert', None) if has_expert_dim else P(None)
+        elif 'temperature' in path_str:
+            return P(None)  # Always replicate temperature parameter
+    
+    # Output projection and embedding layers
+    if 'output_proj' in path_str:
+        if 'kernel' in path_str:
+            return P('expert', 'model', 'batch') if has_expert_dim else P('model', 'batch')
+        elif 'bias' in path_str and param.size > 10000:
+            return P('model')
+        return P(None)
     
     if 'token_embedding' in path_str and 'embedding' in path_str:
         return P('expert', 'model', None) if has_expert_dim else P('model', None)
-
-    # 2. Attention projection layers - add kernel check
+    
+    # Attention layers
     if 'attention' in path_str:
         if has_expert_dim:
             if 'q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str:
-                if 'kernel' in path_str:  # Only shard kernel matrices
+                if 'kernel' in path_str:
                     return P('expert', None, 'model')
-            if 'out_proj' in path_str and 'kernel' in path_str:
-                return P('expert', 'model', None)
+                return P(None)
+            if 'out_proj' in path_str:
+                if 'kernel' in path_str:
+                    return P('expert', 'model', None)
+                return P(None)
         else:
-            # Only apply to kernel parameters, not biases
-            if 'out_proj' in path_str and 'kernel' in path_str:
+            if 'kernel' in path_str:
                 return P('model', 'batch')
-
-    # 3. Router parameters
-    if 'router' in path_str and 'gate' in path_str and 'kernel' in path_str:
-        return P('expert', 'model', None) if has_expert_dim else P('model', None)
-
-    # 4. Expert FFN layers
-    if 'experts' in path_str and ('keys' in path_str or 'values' in path_str) and 'kernel' in path_str:
-        if has_expert_dim:
-            return P('expert', 'model', None)
-        else:
-            return P('model', 'batch')
-
-    # 5. Layer normalization parameters - always replicate 1D params
+            return P(None)
+    
+    # Layer normalization parameters
     if 'norm' in path_str or 'layernorm' in path_str or 'rmsnorm' in path_str:
-        return P(None)  # Changed from 3D None spec
+        return P(None)  # Always replicate normalization parameters
     
-    # 6. Size-based fallbacks - replicate small params
-    if param.size < 10_000:
-        return P(None)  # Changed from 3D None spec
+    # Size-based fallbacks
+    if param.size < 10000:
+        return P(None)
     
-    # 7. Handle 1D parameters safely
-    if param.ndim <= 1:
-        return P(None)  # Changed from sharding along 'model'
+    # Default for remaining 2D+ parameters
+    if param.ndim >= 2:
+        return P('model', 'batch') if not has_expert_dim else P('expert', 'model', None)
     
-    # Default for remaining matrices
-    return P('batch', 'model')
+    # Default fallback for any other parameters
+    return P(None)
 
 def prefetch(iterator, size):
     queue = collections.deque()
