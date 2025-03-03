@@ -407,7 +407,7 @@ def create_batch(mesh, inputs):
             return examples
 
 def check_for_nans(tree, name=""):
-    """Check for NaNs in a PyTree structure."""
+    """Check for NaNs in a PyTree structure (non-jitted version)."""
     flat_tree = jax.tree_util.tree_leaves(tree)
     for i, array in enumerate(flat_tree):
         if jnp.isnan(array).any():
@@ -417,17 +417,28 @@ def check_for_nans(tree, name=""):
             return True
     return False
 
+# Create a jittable version that returns metrics instead of using conditionals
+def get_nan_metrics(tree):
+    """Get NaN metrics for a PyTree structure (jittable version)."""
+    flat_tree = jax.tree_util.tree_leaves(tree)
+    metrics = {}
+    
+    for i, array in enumerate(flat_tree):
+        # Instead of conditionals, just compute metrics
+        has_nans = jnp.isnan(array).any()
+        nan_count = jnp.sum(jnp.isnan(array))
+        metrics[f'has_nans_{i}'] = has_nans
+        metrics[f'nan_count_{i}'] = nan_count
+    
+    return metrics
+
 @jax.jit
 def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rngs: jax.random.PRNGKey):
-    """Perform a single training step with model and data parallelism."""
     noise_rng = jax.random.fold_in(rngs, state.step)
     
-    # Check input batch for NaNs
-    check_for_nans(batch, "input batch")
+    # Don't check for NaNs inside the jitted function
+    # Instead, collect metrics we can check outside
     
-    # Check model parameters for NaNs
-    check_for_nans(state.params, "model parameters")
-
     def loss_fn(params):
         # Forward pass
         logits, router_loss = state.apply_fn(
@@ -437,7 +448,7 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
             rngs={'noise': noise_rng}
         )
         
-        # Check outputs for NaNs
+        # Compute metrics without conditionals
         has_nan_logits = jnp.isnan(logits).any()
         has_nan_router = jnp.isnan(router_loss).any()
         
@@ -474,7 +485,8 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
             'has_nan_ce': has_nan_ce,
             'has_nan_final': has_nan_final,
             'max_logit': jnp.max(shift_logits),
-            'min_logit': jnp.min(shift_logits)
+            'min_logit': jnp.min(shift_logits),
+            'mask_sum': jnp.sum(loss_mask)
         }
         
         return total_loss, (main_loss, router_loss, debug_info)
@@ -482,11 +494,11 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (total_loss, aux), grads = grad_fn(state.params)
     
-    # Check gradients for NaNs
-    check_for_nans(grads, "gradients")
-    
     # Extract debug info
     main_loss, router_loss, debug_info = aux
+    
+    # Collect NaN metrics for gradients
+    grad_nan_metrics = get_nan_metrics(grads)
     
     # Update model
     new_state = state.apply_gradients(grads=grads)
@@ -495,7 +507,8 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
         'loss': total_loss,
         'main_loss': main_loss,
         'router_loss': router_loss,
-        **debug_info  # Include all debug info in metrics
+        **debug_info,  # Include all debug info in metrics
+        **grad_nan_metrics  # Include gradient NaN metrics
     }
 
     return new_state, metrics
