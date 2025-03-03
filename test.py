@@ -9,7 +9,7 @@ from flax.training import orbax_utils
 import time
 import functools
 
-CONTEXT_LENGTH = 512
+CONTEXT_LENGTH = 2048
 VOCAB_SIZE = 50257
 # Pad vocab size to be divisible by 128 for better TPU/GPU utilization
 PADDED_VOCAB_SIZE = ((VOCAB_SIZE + 127) // 128) * 128  # = 50304
@@ -19,15 +19,15 @@ MODEL_CONFIG = {
     'num_blocks': 12,
     'num_heads': 8,
     'd_model': 512,
-    'hidden_size': 2048,
+    'hidden_size': 4096,
     'max_seq_length': CONTEXT_LENGTH,
     'vocab_size': PADDED_VOCAB_SIZE,  # GPT-2 vocab size
     'num_experts': 16,
     'num_shared_experts': 1,
     'use_gradient_checkpointing': False,
     'training': False,
-    'attention_latent_dim': 32,
-    'num_constant_experts': 2,
+    'attention_latent_dim': 48,
+    'num_constant_experts': 4,
     'num_noise_experts': 1,
 }
 
@@ -62,7 +62,7 @@ def model_forward(model, params, input_ids, attention_mask, rng):
 def load_model():
     """Load model from checkpoint."""
     # Try to use unsharded checkpoint first
-    unsharded_dir = os.path.abspath("./checkpoints/checkpoint_20000")
+    unsharded_dir = os.path.abspath("./checkpoints/checkpoint_25000")
     
     # Initialize model with the same config as during training
     model = create_model()
@@ -75,23 +75,13 @@ def load_model():
     variables = model.init(rng, dummy_input, dummy_mask)
     state = {'params': variables['params']}
     
-    # Check if unsharded checkpoint exists
-    if os.path.exists(unsharded_dir):
-        try:
-            print(f"Loading from checkpoint at {unsharded_dir}...")
-            state = checkpoints.restore_checkpoint(unsharded_dir, target=state)
-            if state is not None:
-                print("Successfully loaded checkpoint.")
-                return model, state
-        except Exception as e:
-            print(f"Error loading unsharded checkpoint: {e}")
-    print("Initializing model with random weights...")
-    
+    #state = checkpoints.restore_checkpoint(unsharded_dir, target=state)
+
     return model, state
 
 def generate_text(prompt, model, state, tokenizer, 
                  max_new_tokens=50,  # Reduced from 100 to 50 for faster generation
-                 temperature=0.2,
+                 temperature=0.8,
                  top_k=50):  # Add timeout to prevent hanging
     """Generate text using a simple autoregressive approach with timeout."""
     # Tokenize the prompt

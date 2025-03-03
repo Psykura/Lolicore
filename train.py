@@ -31,9 +31,9 @@ import itertools
 CONTEXT_LENGTH = 2048
 BATCH_SIZE = 8
 NUM_EPOCHS = 5
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 1e-5
 WARMUP_STEPS = 100
-GRADIENT_CLIP_NORM = 1.0
+GRADIENT_CLIP_NORM = 0.5
 BATCH_MESH_SIZE = 4
 DTYPE = jnp.bfloat16  # Set default dtype to bfloat16
 PARALLEL_PROCESSING = 16
@@ -182,7 +182,7 @@ def create_train_state(
             b2=0.999,
             eps=1e-8,
             weight_decay=0.001,
-            mu_dtype=DTYPE,
+            mu_dtype=jnp.float32,  # Use float32 for momentum
         )
     )
 
@@ -248,42 +248,38 @@ def prepare_dataset(tokenizer):
             add_special_tokens=True
         )
 
-        # Chunk into context_length segments
         chunks = []
         attention_masks = []
 
         for input_ids in tokenized['input_ids']:
-            # Skip if sequence is too short or empty
-            if len(input_ids) < 32 or not any(input_ids):  # Skip very short or empty sequences
+            if len(input_ids) < 32 or not any(input_ids):
                 continue
 
-            # Split into chunks of context_length
-            for i in range(0, len(input_ids) + CONTEXT_LENGTH, CONTEXT_LENGTH):
+            # Split into chunks of exactly context_length
+            for i in range(0, len(input_ids), CONTEXT_LENGTH):
                 chunk = input_ids[i:i + CONTEXT_LENGTH]
                 
-                # Only process chunks that are reasonably sized
+                # Skip if too short
                 if len(chunk) < 32:
                     continue
                     
-                # Pad the last chunk if needed
+                # Handle padding
                 if len(chunk) < CONTEXT_LENGTH:
-                    # Calculate padding length
                     padding_length = CONTEXT_LENGTH - len(chunk)
-                    # Create attention mask with 1s for real tokens and 0s for padding
                     attention_mask = [1] * len(chunk) + [0] * padding_length
-                    # Pad the chunk with EOS tokens
                     chunk = chunk + [tokenizer.eos_token_id] * padding_length
                 else:
-                    # No padding needed, attention mask is all 1s
+                    # Truncate if longer than CONTEXT_LENGTH
+                    chunk = chunk[:CONTEXT_LENGTH]
                     attention_mask = [1] * CONTEXT_LENGTH
-                
+
                 chunks.append(chunk)
                 attention_masks.append(attention_mask)
 
         return {
             'input_ids': chunks,
             'attention_mask': attention_masks,
-            'labels': chunks  # For causal language modeling
+            'labels': chunks
         }
 
     # Use sequential processing without caching
@@ -416,21 +412,6 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
     #rngs, noise_rng = jax.random.split(rngs)
     noise_rng = rngs
 
-    def stable_cross_entropy(logits, labels):
-        # Compute max for numerical stability
-        max_logits = jnp.max(logits, axis=-1, keepdims=True)
-        # Subtract max from logits to prevent overflow
-        shifted_logits = logits - max_logits
-        # Compute log sum exp
-        exp_shifted = jnp.exp(shifted_logits)
-        log_sum_exp = jnp.log(jnp.sum(exp_shifted, axis=-1, keepdims=True))
-        # Compute log probabilities
-        log_probs = shifted_logits - log_sum_exp
-        # Gather log probs of true labels
-        label_log_probs = jnp.take_along_axis(log_probs, labels[..., None], axis=-1)
-        # Return mean negative log likelihood
-        return -jnp.mean(label_log_probs)
-
     def loss_fn(params):
         logits, router_loss = state.apply_fn(
             {'params': params},
@@ -439,12 +420,16 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], rng
             rngs={'noise': noise_rng}
         )
 
-        # Calculate main loss using stable cross entropy
+        # Calculate main loss using stable cross entropy with float32 precision
         shift_logits = logits[..., :-1, :]
         shift_labels = batch['labels'][..., 1:]
-        main_loss = stable_cross_entropy(shift_logits, shift_labels)
+        # Cast to float32 for loss calculation
+        shift_logits = shift_logits.astype(jnp.float32)
+        shift_labels = shift_labels.astype(jnp.float32)
+        main_loss = optax.softmax_cross_entropy(shift_logits, shift_labels)
+        # Cast router loss to float32 as well for consistency
+        router_loss = router_loss.astype(jnp.float32)
 
-        # Combine losses in bfloat16
         total_loss = main_loss + router_loss
 
         return total_loss, (main_loss, router_loss)
