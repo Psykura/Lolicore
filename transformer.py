@@ -265,7 +265,7 @@ class Router(nn.Module):
         if self.training:
             # Calculate load balancing loss
             # Ideal: uniform distribution across experts
-            expert_usage = jnp.sum(router_probs, axis=(0, 1)) / total_tokens
+            expert_usage = jnp.sum(router_probs, axis=(0, 1)) / (total_tokens + 1e-5)
             balance_loss = (self.num_experts * jnp.sum(expert_usage ** 2) - 1.0) * self.balance_loss_coef
             
             # Calculate router z-loss to stabilize routing probabilities
@@ -470,6 +470,7 @@ class ExpertsFeedForward(nn.Module):
             # Recalculate for exact division
             group_size = num_tokens // num_groups
         
+        jax.debug.print('group_size: {group_size}, num_groups: {num_groups}', group_size=group_size, num_groups=num_groups)
         return group_size, num_groups
 
     def _process_shared_experts(self, x):
