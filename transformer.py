@@ -223,110 +223,121 @@ class Router(nn.Module):
     d_model: int
     num_experts: int
     z_loss_coef: float = 1e-3
-    balance_loss_coef: float = 4e-2
+    balance_loss_coef: float = 1e-2  # Reduced from 4e-2
     dtype: jnp.dtype = jnp.bfloat16
     training: bool = False
     use_gradient_checkpointing: bool = False
 
     def setup(self):
         # Gate network that produces logits for expert assignment
-        gate_init = nn.initializers.normal(stddev=0.02)
+        # Increased initialization scale and added bias
+        gate_init = nn.initializers.normal(stddev=0.1)
+        bias_init = nn.initializers.normal(stddev=0.01)
         self.gate = nn.Dense(
             features=self.num_experts,
-            use_bias=False,
+            use_bias=True,  # Added bias term
             kernel_init=gate_init,
+            bias_init=bias_init,
             dtype=self.dtype
+        )
+        # Temperature parameter for routing
+        self.temperature = self.param(
+            'temperature',
+            nn.initializers.constant(1.0),
+            (1,),
+            self.dtype
         )
 
     def __call__(self, x, expert_capacity: int, use_mask_routing: bool = False):
-        """Route tokens to experts based on learned assignment.
-        
-        Args:
-            x: Input tensor of shape (num_groups, group_size, d_model)
-            expert_capacity: Maximum number of tokens per expert
-            
-        Returns:
-            If training:
-                expert_masks: Tensor of shape (num_experts, num_groups, group_size) containing binary masks
-                weight_masks: Tensor of shape (num_experts, num_groups, group_size) containing routing weights
-                loss: Combined router loss (balance + z-loss)
-            Else:
-                indices: Tensor of shape (num_experts, expert_capacity, 2) containing (group, position) indices
-                weights: Tensor of shape (num_experts, expert_capacity) containing routing weights
-                loss: Combined router loss (balance + z-loss)
-        """
+        """Route tokens to experts based on learned assignment."""
         num_groups, group_size, _ = x.shape
         total_tokens = num_groups * group_size
         
-        # Compute routing probabilities
+        # Compute routing probabilities with temperature scaling
         router_logits = self.gate(x)  # (num_groups, group_size, num_experts)
-        router_probs = jax.nn.softmax(router_logits, axis=-1)
+        # Clamp temperature to avoid division by zero
+        safe_temp = jnp.maximum(self.temperature, 0.1)
+        scaled_logits = router_logits / safe_temp
+        router_probs = jax.nn.softmax(scaled_logits, axis=-1)
         
         if self.training:
-            # Calculate load balancing loss
-            # Ideal: uniform distribution across experts
+            # Calculate load balancing loss with improved metrics
+            # 1. Expert usage - how much each expert is used
             expert_usage = jnp.sum(router_probs, axis=(0, 1)) / (total_tokens + 1e-5)
-            balance_loss = (self.num_experts * jnp.sum(expert_usage ** 2) - 1.0) * self.balance_loss_coef
             
-            # Calculate router z-loss to stabilize routing probabilities
-            # Penalizes large values in the routing logits
+            # 2. Expert assignment entropy - measures routing diversity
+            entropy = -jnp.sum(router_probs * jnp.log(router_probs + 1e-5), axis=-1)
+            mean_entropy = jnp.mean(entropy)
+            target_entropy = 0.5 * jnp.log(self.num_experts)  # Target some uncertainty
+            entropy_loss = jnp.abs(mean_entropy - target_entropy)
+            
+            # 3. Expert load balance loss - penalize uneven expert usage
+            target_usage = 1.0 / self.num_experts
+            usage_loss = jnp.mean(jnp.square(expert_usage - target_usage))
+            
+            # 4. Confidence loss - encourage peaked distributions
+            confidence = jnp.max(router_probs, axis=-1)
+            confidence_loss = jnp.mean(1.0 - confidence)
+            
+            # 5. Router z-loss to prevent extreme logit values
             router_z = jax.nn.logsumexp(router_logits, axis=-1)
             router_z_loss = jnp.mean(jnp.square(router_z)) * self.z_loss_coef
             
-            # Combined loss
+            # Combine losses with better balanced weights
+            balance_loss = (
+                usage_loss * self.balance_loss_coef +  # Load balancing
+                confidence_loss * 0.01 +  # Reduced weight for confidence
+                entropy_loss * 0.005  # Very small weight for entropy to allow specialization
+            )
+            
             loss = balance_loss + router_z_loss
         else:
             loss = 0.0
         
+        # Add noise during training to break symmetry
+        if self.training:
+            noise = jax.random.normal(
+                self.make_rng('noise'),
+                router_probs.shape,
+                dtype=router_probs.dtype
+            ) * 0.01
+            router_probs = nn.softmax(jnp.log(router_probs + 1e-5) + noise)
+        
         # Reshape for expert-wise token selection
-        # (num_experts, num_groups * group_size)
         flat_probs = router_probs.transpose(2, 0, 1).reshape(self.num_experts, -1)
-
-        # Pad with large negative values to ensure they are never selected
-        padding_width = max(0, expert_capacity - flat_probs.shape[1])
-        flat_probs = jnp.pad(
-            flat_probs,
-            ((0, 0), (0, padding_width)),
-            mode='constant',
-            constant_values=-1e4  # Use a smaller negative value to avoid numerical issues
-        )
         
-        # Select top tokens for each expert, now safe since input is padded
+        # Select top tokens for each expert
         scores, token_indices = jax.lax.top_k(flat_probs, k=expert_capacity)
+        scores = jnp.where(scores > 0.0, scores, 0.0)  # Zero out padding scores
         
-        # Zero out scores for padded values - use a less extreme threshold
-        scores = jnp.where(scores > -1e3, scores, 0.0)
-        
-        # Convert flat indices to (group, position) coordinates
+        # Convert flat indices to coordinates
         group_indices = token_indices // group_size
         pos_indices = token_indices % group_size
         
         if use_mask_routing:
-            # For training, create masks directly from the selected indices
-            # Initialize masks
+            # Create masks for training
             expert_masks = jnp.zeros((self.num_experts, num_groups, group_size), dtype=jnp.bool_)
             weight_masks = jnp.zeros((self.num_experts, num_groups, group_size), dtype=self.dtype)
             
-            # Create a list of indices for scatter operations
+            # Create indices for scatter
             batch_indices = jnp.arange(self.num_experts)[:, None]
             batch_indices = jnp.broadcast_to(batch_indices, (self.num_experts, expert_capacity))
             
-            # Flatten for scatter operation
+            # Flatten for scatter
             flat_batch_indices = batch_indices.reshape(-1)
             flat_group_indices = group_indices.reshape(-1)
             flat_pos_indices = pos_indices.reshape(-1)
             flat_scores = scores.reshape(-1)
             
-            # Create indices for scatter
+            # Create scatter indices
             scatter_indices = jnp.stack([flat_batch_indices, flat_group_indices, flat_pos_indices], axis=1)
             
-            # Use scatter to update the masks
+            # Update masks
             expert_masks = expert_masks.at[scatter_indices[:, 0], scatter_indices[:, 1], scatter_indices[:, 2]].set(True)
             weight_masks = weight_masks.at[scatter_indices[:, 0], scatter_indices[:, 1], scatter_indices[:, 2]].set(flat_scores)
             
             return expert_masks, weight_masks, loss
         else:
-            # For inference, return indices and weights
             indices = jnp.stack([group_indices, pos_indices], axis=-1)
             return indices, scores, loss
 
