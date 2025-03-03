@@ -51,26 +51,75 @@ def create_dummy_batch(batch_size=DEBUG_BATCH_SIZE, seq_length=DEBUG_SEQ_LENGTH)
     }
 
 def log_tensor_stats(tensor, name, step):
-    """Check statistics about a tensor to identify numerical issues."""
-    # Keep everything as JAX arrays to work within JIT
-    stats = {
-        'min': jnp.min(tensor),
-        'max': jnp.max(tensor),
-        'mean': jnp.mean(tensor),
-        'std': jnp.std(tensor),
-        'has_nan': jnp.any(jnp.isnan(tensor)),
-        'has_inf': jnp.any(jnp.isinf(tensor)),
+    """Log detailed statistics about a tensor."""
+    if tensor is None:
+        return {
+            'mean': 0.0,
+            'std': 0.0,
+            'min': 0.0,
+            'max': 0.0,
+            'has_nan': False,
+            'has_inf': False
+        }
+    
+    # Convert to float32 for stable computation
+    if tensor.dtype != jnp.float32:
+        tensor = tensor.astype(jnp.float32)
+    
+    # Basic statistics
+    mean = jnp.mean(tensor)
+    std = jnp.std(tensor)
+    min_val = jnp.min(tensor)
+    max_val = jnp.max(tensor)
+    
+    # Check for numerical issues
+    has_nan = jnp.any(jnp.isnan(tensor))
+    has_inf = jnp.any(jnp.isinf(tensor))
+    
+    # Additional statistics for router analysis
+    if tensor.ndim >= 2 and 'router' in name.lower():
+        # For router probabilities/logits
+        if 'prob' in name.lower() or 'weight' in name.lower():
+            entropy = -jnp.sum(tensor * jnp.log(tensor + 1e-5), axis=-1)
+            mean_entropy = float(jnp.mean(entropy))
+            max_prob = float(jnp.max(tensor))
+            sparsity = float(jnp.mean(tensor < 1e-5))
+            
+            return {
+                'mean': float(mean),
+                'std': float(std),
+                'min': float(min_val),
+                'max': float(max_val),
+                'has_nan': bool(has_nan),
+                'has_inf': bool(has_inf),
+                'entropy': mean_entropy,
+                'max_prob': max_prob,
+                'sparsity': sparsity
+            }
+        # For expert masks
+        elif 'mask' in name.lower():
+            active_experts = float(jnp.mean(jnp.sum(tensor, axis=0) > 0))
+            tokens_per_expert = float(jnp.mean(jnp.sum(tensor, axis=(1, 2))))
+            
+            return {
+                'mean': float(mean),
+                'std': float(std),
+                'min': float(min_val),
+                'max': float(max_val),
+                'has_nan': bool(has_nan),
+                'has_inf': bool(has_inf),
+                'active_experts_ratio': active_experts,
+                'tokens_per_expert': tokens_per_expert
+            }
+    
+    return {
+        'mean': float(mean),
+        'std': float(std),
+        'min': float(min_val),
+        'max': float(max_val),
+        'has_nan': bool(has_nan),
+        'has_inf': bool(has_inf)
     }
-    
-    # Count NaNs and Infs
-    if stats['has_nan'] or stats['has_inf']:
-        stats['nan_count'] = jnp.sum(jnp.isnan(tensor))
-        stats['inf_count'] = jnp.sum(jnp.isinf(tensor))
-        stats['total_elements'] = tensor.size
-        stats['nan_percentage'] = stats['nan_count'] / stats['total_elements'] * 100
-        stats['inf_percentage'] = stats['inf_count'] / stats['total_elements'] * 100
-    
-    return stats
 
 def print_stats(stats, name):
     """Helper function to print statistics after computation."""
@@ -103,10 +152,19 @@ def log_activation_flow(model_outputs, step):
     """Log activation statistics at different points in the model."""
     activation_stats = {}
     
-    # Log logits
+    # Log logits and router loss
     logits, router_loss = model_outputs
     activation_stats['logits'] = log_tensor_stats(logits, "logits", step)
-    activation_stats['router_loss'] = log_tensor_stats(router_loss, "router_loss", step)
+    
+    # Detailed router loss analysis
+    if isinstance(router_loss, (tuple, list)):
+        # If router_loss contains multiple components
+        activation_stats['router_loss'] = {
+            'total': float(sum(router_loss)),
+            'components': [float(x) for x in router_loss]
+        }
+    else:
+        activation_stats['router_loss'] = float(router_loss)
     
     return activation_stats
 
@@ -222,90 +280,101 @@ def debug_train_step(state, batch, rngs, step):
 
 def debug_router_module(router, batch_size=DEBUG_BATCH_SIZE, seq_length=DEBUG_SEQ_LENGTH):
     """Specifically debug the Router module to identify numerical issues."""
-    print("Debugging Router module...")
+    print("\nDebugging Router module...")
     
-    # Create a dummy input for the router with more varied data
+    # Create varied test inputs
     num_groups = 2
     group_size = (batch_size * seq_length) // num_groups
     d_model = MODEL_CONFIG['d_model']
     
-    # Create random input with different patterns
-    key = jax.random.PRNGKey(0)
-    keys = jax.random.split(key, 3)
+    def create_test_pattern(key, pattern_type="normal"):
+        if pattern_type == "normal":
+            return jax.random.normal(key, (num_groups, group_size, d_model))
+        elif pattern_type == "uniform":
+            return jax.random.uniform(key, (num_groups, group_size, d_model))
+        elif pattern_type == "sparse":
+            x = jnp.zeros((num_groups, group_size, d_model))
+            mask = jax.random.bernoulli(key, p=0.1, shape=(num_groups, group_size, 1))
+            values = jax.random.normal(jax.random.split(key)[0], (num_groups, group_size, d_model))
+            return x + values * mask
+        elif pattern_type == "clustered":
+            # Create clustered data to test expert specialization
+            centers = jax.random.normal(key, (4, d_model))
+            assignments = jax.random.randint(
+                jax.random.split(key)[0],
+                shape=(num_groups, group_size),
+                minval=0,
+                maxval=4
+            )
+            x = centers[assignments]
+            noise = jax.random.normal(jax.random.split(key)[0], x.shape) * 0.1
+            return x + noise
     
-    # Create three different patterns in the input
-    x1 = jax.random.normal(keys[0], (num_groups, group_size, d_model))
-    x2 = jax.random.uniform(keys[1], (num_groups, group_size, d_model))
-    x3 = jnp.zeros((num_groups, group_size, d_model)).at[0, :, :].set(
-        jax.random.normal(keys[2], (group_size, d_model))
-    )
-    
-    # Mix the patterns
-    mix_ratio = jnp.array([0.6, 0.3, 0.1])
-    x = (x1 * mix_ratio[0] + x2 * mix_ratio[1] + x3 * mix_ratio[2])
-    
-    # Convert to bfloat16 if needed
-    if router.dtype == jnp.bfloat16:
-        x = x.astype(jnp.bfloat16)
-    
-    # Initialize router with different random key
-    params = router.init(jax.random.PRNGKey(42), x, expert_capacity=4)
-    
-    # Test with different expert capacities
+    # Test with different input patterns
+    patterns = ["normal", "uniform", "sparse", "clustered"]
     capacities = [1, 4, 8, 16, 32]
     
-    for capacity in capacities:
-        print(f"\nTesting with expert_capacity={capacity}")
-        print(f"Input shape: {x.shape}, dtype: {x.dtype}")
+    for pattern in patterns:
+        print(f"\nTesting with {pattern} input distribution:")
+        key = jax.random.PRNGKey(hash(pattern) % 2**32)
+        x = create_test_pattern(key, pattern)
         
-        # Run router in training mode
-        router.training = True
-        try:
-            # Test with different noise keys to ensure routing varies
-            for i in range(3):
-                noise_key = jax.random.PRNGKey(i)
-                expert_masks, weight_masks, loss = router.apply(
-                    params, x, expert_capacity=capacity, use_mask_routing=True,
-                    rngs={'noise': noise_key}
-                )
-                
-                # Log statistics
-                expert_stats = log_tensor_stats(expert_masks, f"router_expert_masks_cap{capacity}", i)
-                weight_stats = log_tensor_stats(weight_masks, f"router_weight_masks_cap{capacity}", i)
-                loss_stats = log_tensor_stats(jnp.array([loss]), f"router_loss_cap{capacity}", i)
-                
-                print(f"  Training iteration {i+1}:")
-                print(f"    Loss: {float(loss)}")
-                print(f"    Expert mask stats - mean: {float(expert_stats['mean']):.4f}, std: {float(expert_stats['std']):.4f}")
-                print(f"    Weight mask stats - mean: {float(weight_stats['mean']):.4f}, std: {float(weight_stats['std']):.4f}")
-        except Exception as e:
-            print(f"  Error in training mode: {e}")
+        if router.dtype == jnp.bfloat16:
+            x = x.astype(jnp.bfloat16)
         
-        # Run router in inference mode
-        router.training = False
-        try:
-            # Test inference with different inputs
-            for i in range(2):
-                test_key = jax.random.PRNGKey(i + 100)
-                test_input = jax.random.normal(test_key, (num_groups, group_size, d_model))
-                if router.dtype == jnp.bfloat16:
-                    test_input = test_input.astype(jnp.bfloat16)
-                
-                indices, scores, loss = router.apply(
-                    params, test_input, expert_capacity=capacity
-                )
-                
-                # Log statistics
-                indices_stats = log_tensor_stats(indices, f"router_indices_cap{capacity}", i)
-                scores_stats = log_tensor_stats(scores, f"router_scores_cap{capacity}", i)
-                loss_stats = log_tensor_stats(jnp.array([loss]), f"router_loss_inference_cap{capacity}", i)
-                
-                print(f"  Inference test {i+1}:")
-                print(f"    Loss: {float(loss)}")
-                print(f"    Scores stats - mean: {float(scores_stats['mean']):.4f}, std: {float(scores_stats['std']):.4f}")
-                print(f"    Unique expert assignments: {len(jnp.unique(indices))}")
-        except Exception as e:
-            print(f"  Error in inference mode: {e}")
+        # Initialize router
+        params = router.init(jax.random.PRNGKey(42), x, expert_capacity=4)
+        
+        for capacity in capacities:
+            print(f"\n  Testing with expert_capacity={capacity}")
+            
+            # Training mode tests
+            router.training = True
+            try:
+                for i in range(3):
+                    noise_key = jax.random.PRNGKey(i)
+                    expert_masks, weight_masks, loss = router.apply(
+                        params, x, expert_capacity=capacity,
+                        use_mask_routing=True,
+                        rngs={'noise': noise_key}
+                    )
+                    
+                    # Log detailed statistics
+                    mask_stats = log_tensor_stats(expert_masks, f"router_expert_masks_{pattern}_cap{capacity}", i)
+                    weight_stats = log_tensor_stats(weight_masks, f"router_weights_{pattern}_cap{capacity}", i)
+                    
+                    print(f"\n    Training iteration {i+1}:")
+                    print(f"      Loss: {float(loss):.6f}")
+                    print(f"      Active experts: {mask_stats['active_experts_ratio']:.2%}")
+                    print(f"      Tokens per expert: {mask_stats['tokens_per_expert']:.1f}")
+                    print(f"      Routing entropy: {weight_stats.get('entropy', 0):.3f}")
+                    print(f"      Max routing probability: {weight_stats.get('max_prob', 0):.3f}")
+                    print(f"      Routing sparsity: {weight_stats.get('sparsity', 0):.2%}")
+            
+            except Exception as e:
+                print(f"    Error in training mode: {e}")
+            
+            # Inference mode tests
+            router.training = False
+            try:
+                for i in range(2):
+                    indices, scores, loss = router.apply(
+                        params, x, expert_capacity=capacity,
+                        rngs={'noise': jax.random.PRNGKey(i + 100)}
+                    )
+                    
+                    # Analyze routing decisions
+                    unique_experts = len(jnp.unique(indices[..., 0]))
+                    max_score = float(jnp.max(scores))
+                    mean_score = float(jnp.mean(scores))
+                    
+                    print(f"\n    Inference test {i+1}:")
+                    print(f"      Active experts: {unique_experts}/{router.num_experts}")
+                    print(f"      Max routing score: {max_score:.3f}")
+                    print(f"      Mean routing score: {mean_score:.3f}")
+            
+            except Exception as e:
+                print(f"    Error in inference mode: {e}")
     
     print("\nRouter debugging complete.")
 
