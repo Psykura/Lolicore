@@ -51,7 +51,7 @@ def create_dummy_batch(batch_size=DEBUG_BATCH_SIZE, seq_length=DEBUG_SEQ_LENGTH)
     }
 
 def log_tensor_stats(tensor, name, step):
-    """Log statistics about a tensor to help identify numerical issues."""
+    """Check statistics about a tensor to identify numerical issues."""
     # Convert to numpy for easier handling
     if hasattr(tensor, 'device_buffer'):
         tensor = np.array(tensor)
@@ -74,20 +74,10 @@ def log_tensor_stats(tensor, name, step):
         stats['nan_percentage'] = stats['nan_count'] / stats['total_elements'] * 100
         stats['inf_percentage'] = stats['inf_count'] / stats['total_elements'] * 100
     
-    # Save statistics
-    filename = f"step_{step}_{name}_stats.pkl"
-    with open(os.path.join(LOG_DIR, filename), 'wb') as f:
-        pickle.dump(stats, f)
-    
-    # If tensor is small enough, save the full tensor
-    if tensor.size < 10000:
-        full_filename = f"step_{step}_{name}_full.npy"
-        np.save(os.path.join(LOG_DIR, full_filename), tensor)
-    
     return stats
 
 def log_gradient_flow(grads, step):
-    """Log gradient statistics for each parameter."""
+    """Check gradient statistics for each parameter."""
     grad_stats = {}
     
     # Flatten the nested dictionary structure
@@ -102,15 +92,6 @@ def log_gradient_flow(grads, step):
         name: stats for name, stats in grad_stats.items() 
         if stats.get('has_nan', False) or stats.get('has_inf', False)
     }
-    
-    # Save summary of problematic parameters
-    if problematic_params:
-        with open(os.path.join(LOG_DIR, f"step_{step}_problematic_grads.txt"), 'w') as f:
-            for name, stats in problematic_params.items():
-                f.write(f"Parameter: {name}\n")
-                for k, v in stats.items():
-                    f.write(f"  {k}: {v}\n")
-                f.write("\n")
     
     return grad_stats, problematic_params
 
@@ -127,36 +108,8 @@ def log_activation_flow(model_outputs, step):
 
 def visualize_gradient_distribution(grad_stats, step):
     """Create histograms of gradient distributions."""
-    plt.figure(figsize=(12, 8))
-    
-    # Collect all gradient means and stds
-    means = []
-    stds = []
-    names = []
-    
-    for name, stats in grad_stats.items():
-        if not (stats.get('has_nan', False) or stats.get('has_inf', False)):
-            means.append(stats['mean'])
-            stds.append(stats['std'])
-            names.append(name)
-    
-    # Plot histogram of means
-    plt.subplot(2, 1, 1)
-    plt.hist(means, bins=50)
-    plt.title(f'Gradient Means Distribution (Step {step})')
-    plt.xlabel('Mean Value')
-    plt.ylabel('Count')
-    
-    # Plot histogram of standard deviations
-    plt.subplot(2, 1, 2)
-    plt.hist(stds, bins=50)
-    plt.title(f'Gradient Standard Deviations Distribution (Step {step})')
-    plt.xlabel('Standard Deviation')
-    plt.ylabel('Count')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(LOG_DIR, f"step_{step}_gradient_distribution.png"))
-    plt.close()
+    # Skip visualization to avoid file operations
+    pass
 
 def debug_train_step(state, batch, rngs, step):
     """Debug version of train_step with extensive logging."""
@@ -360,7 +313,7 @@ def debug_experts_feedforward(moe_layer, batch_size=DEBUG_BATCH_SIZE, seq_length
 
 def run_gradient_debug():
     """Main function to run gradient debugging."""
-    print(f"Starting gradient flow debugging. Logs will be saved to {LOG_DIR}")
+    print("Starting gradient flow debugging...")
     
     # Create mesh for distributed training
     mesh, n_devices = create_mesh()
@@ -382,13 +335,24 @@ def run_gradient_debug():
             **MODEL_CONFIG
         )
         
-        # Log initial parameter statistics
-        print("Logging initial parameter statistics...")
+        # Check initial parameter statistics
+        print("Checking initial parameter statistics...")
         tree_leaves_with_path = jax.tree_util.tree_leaves_with_path(state.params)
         
+        problematic_init_params = []
         for path, param in tree_leaves_with_path:
             param_name = '/'.join(str(p) for p in path)
-            log_tensor_stats(param, f"init_param_{param_name}", 0)
+            stats = log_tensor_stats(param, f"init_param_{param_name}", 0)
+            if stats.get('has_nan', False) or stats.get('has_inf', False):
+                problematic_init_params.append((param_name, stats))
+        
+        if problematic_init_params:
+            print("Found problematic initial parameters:")
+            for name, stats in problematic_init_params:
+                print(f"  - {name}:")
+                print(f"    NaNs: {stats.get('nan_count', 0)}, Infs: {stats.get('inf_count', 0)}")
+        else:
+            print("No issues found in initial parameters")
         
         # Debug specific modules
         print("\nDebugging specific modules...")
@@ -432,22 +396,12 @@ def run_gradient_debug():
             else:
                 print("  No NaN/Inf gradients detected")
             
-            # Log step time
+            # Log step time and loss
             step_time = time.time() - start_time
             print(f"  Step completed in {step_time:.2f}s")
             print(f"  Loss: {metrics['loss']}")
-            
-            # Save summary for this step
-            with open(os.path.join(LOG_DIR, f"step_{step}_summary.txt"), 'w') as f:
-                f.write(f"Step {step} Summary\n")
-                f.write(f"Total Loss: {metrics['loss']}\n")
-                f.write(f"Main Loss: {metrics['main_loss']}\n")
-                f.write(f"Router Loss: {metrics['router_loss']}\n")
-                f.write(f"Step Time: {step_time:.2f}s\n")
-                f.write(f"NaN/Inf Gradients: {len(metrics['problematic_params'])}\n")
     
-    print("\nGradient debugging complete. Check the logs for detailed information.")
-    print(f"Log directory: {LOG_DIR}")
+    print("\nGradient debugging complete.")
 
 def analyze_results():
     """Analyze the debugging results and generate a summary report."""
