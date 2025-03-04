@@ -205,20 +205,14 @@ class Router(nn.Module):
         return jnp.stack([group_indices, pos_indices], axis=-1), scores, loss
 
     def token_choose_experts(self, x, experts_top_k: int):
-        # x: [batch_size * seq_len, d_model]
-        total_tokens, _ = x.shape
-        
+        # x: [batch_size * seq_len, d_model]        
         router_logits = self.gate(x)
         
-        safe_temp = jnp.maximum(self.temperature, 0.1)
-        router_probs = jax.nn.softmax(router_logits / safe_temp, axis=-1)
-
-        # Get top-k expert indices and probabilities for each token
-        top_k_probs, top_k_indices = jax.lax.top_k(router_probs, k=experts_top_k)
+        # Get top-k logits and indices directly from unnormalized logits
+        top_k_logits, top_k_indices = jax.lax.top_k(router_logits, k=experts_top_k)
         
-        # Renormalize the top-k probabilities
-        top_k_probs_sum = jnp.sum(top_k_probs, axis=-1, keepdims=True)
-        top_k_weights = top_k_probs / (top_k_probs_sum + 1e-9)
+        # Apply temperature scaling and softmax only on the top-k logits
+        top_k_weights = jax.nn.softmax(top_k_logits / self.temperature, axis=-1)
 
         return top_k_indices, top_k_weights
 
@@ -372,11 +366,11 @@ class ExpertsFeedForward(nn.Module):
         output = self._process_shared_experts(x_grouped)
 
         # routing experts
-        experts_output = jnp.zeros_like(x)
+        experts_output = jnp.zeros_like(x_grouped)
         for expert_idx, expert in enumerate(self.experts):
             indices = expert_indices[expert_idx]
             weights = routing_weights[expert_idx]
-            tokens = x[indices[:, 0], indices[:, 1]]
+            tokens = x_grouped[indices[:, 0], indices[:, 1]]
             processed = jax.vmap(expert)(tokens) * weights[:, None]
             experts_output = experts_output.at[indices[:, 0], indices[:, 1]].add(processed)
         output = output + experts_output
@@ -386,9 +380,86 @@ class ExpertsFeedForward(nn.Module):
         output = output_flat.reshape(batch_size, seq_len, self.d_model)
         
         return output, router_loss
+    
+    def _compute_token_top_k(self, num_tokens, max_top_k):
+        """Compute top_k value using the same capacity logic as expert_choose_tokens"""
+        # Use the same group size computation as expert_choose_tokens
+        if num_tokens < 12:
+            return round(self.expert_capacity_factor)
+        
+        _, num_groups, expert_capacity = self._compute_group_size(1, num_tokens)
+        
+        # Calculate total assignments possible across all groups
+        total_assignments = self.num_experts * expert_capacity * num_groups
+        
+        # Calculate ideal top_k based on assignments per token
+        # Each token should get approximately the same number of expert assignments
+        # as in the expert_choose_tokens method
+        ideal_top_k = total_assignments / num_tokens
+        
+        # Round up and apply practical limits
+        top_k = min(
+            max(1, int(ideal_top_k + 0.5)),  # Minimum of 2 experts
+            min(max_top_k, self.num_experts)  # Maximum of max_top_k or num_experts
+        )
+        
+        return top_k  # Returns a Python int
 
-    def __call__(self, x):
-        return self._expert_choose_tokens(x)
+    def _token_choose_experts(self, x, max_top_k: int = 16):
+        batch_size, seq_len, _ = x.shape
+        x_flat = x.reshape(-1, self.d_model)
+        num_tokens = x_flat.shape[0]
+        
+        # Dynamically determine top_k based on input size
+        experts_top_k = self._compute_token_top_k(num_tokens, max_top_k)
+        print(f"experts_top_k: {experts_top_k}")
+        
+        expert_indices, expert_weights = self.router.token_choose_experts(x_flat, experts_top_k=experts_top_k)
+        
+        def expert_fn(i):
+            return lambda mdl, x: mdl.experts[i](x)
+        
+        # Create branch functions for each expert
+        expert_branches = [expert_fn(i) for i in range(len(self.experts))]
+        
+        # Initialize all experts during setup
+        if self.is_mutable_collection('params'):
+            for branch in expert_branches:
+                _ = branch(self, x_flat[:1])  # Use first token to init all experts
+        
+        # Process single token through its experts
+        def process_token(token, token_experts, token_weights):
+            # Get outputs from all top-k experts
+            expert_outputs = []
+            for k in range(experts_top_k):
+                expert_out = nn.switch(token_experts[k], expert_branches, self, token[None])
+                expert_outputs.append(expert_out * token_weights[k])
+            return jnp.squeeze(sum(expert_outputs), axis=0)  # Remove the added batch dim
+        
+        # Vectorize the token processing
+        vectorized_process = jax.vmap(process_token)
+        
+        # Process all tokens at once
+        outputs = vectorized_process(
+            x_flat,
+            expert_indices,
+            expert_weights
+        )
+        
+        # Add shared experts output
+        shared_output = self._process_shared_experts(x_flat)
+        combined_output = outputs + shared_output
+        
+        # Reshape back to original dimensions
+        output = combined_output.reshape(batch_size, seq_len, self.d_model)
+        
+        return output, 0.0
+
+    def __call__(self, x, use_token_choose_experts: bool = False):
+        if use_token_choose_experts and not self.training:
+            return self._token_choose_experts(x)
+        else:
+            return self._expert_choose_tokens(x)
 
 class Block(nn.Module):
     """Transformer block with attention and MoE feed-forward layers."""
