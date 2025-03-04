@@ -15,4 +15,7 @@ dependencies = [
     "transformers>=4.49.0",
     "wandb>=0.19.7",
     "libtpu>=0.0.10; platform_system != 'Darwin'",
+    "matplotlib>=3.10.1",
+    "tensorflow>=2.18.0",
+    "tf2onnx>=1.16.1",
 ]

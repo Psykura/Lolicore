@@ -1,0 +1,11 @@
+jax>=0.4.13
+jaxlib>=0.4.13
+flax>=0.7.2
+matplotlib>=3.7.2
+numpy>=1.24.3
+optax>=0.1.7
+tensorflow>=2.13.0
+jax2tf
+tf2onnx
+onnx>=1.14.0
+onnxruntime 

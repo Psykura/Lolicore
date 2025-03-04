@@ -86,17 +86,20 @@ class MultiHeadAttention(nn.Module):
         q = jnp.transpose(q, (0, 2, 1, 3))
         k = jnp.transpose(k, (0, 2, 1, 3))
         v = jnp.transpose(v, (0, 2, 1, 3))
-
         scores = jnp.einsum('bnqd,bnkd->bnqk', q, k) / jnp.sqrt(self.latent_dim)
-        attn_weights = nn.softmax(scores, axis=-1)
-
-        def apply_causal_mask(weights):
+        
+        # Apply causal mask before softmax
+        def apply_causal_mask(score_matrix):
             row_idx = jnp.arange(seq_len)[None, :]
             col_idx = jnp.arange(seq_len)[:, None]
-            return jnp.where(row_idx >= col_idx, weights, 0.0)
+            return jnp.where(row_idx <= col_idx, score_matrix, -1e9)
         
-        attn_weights = jax.vmap(jax.vmap(apply_causal_mask))(attn_weights)
+        scores = jax.vmap(jax.vmap(apply_causal_mask))(scores)
         
+        # Apply softmax after causal masking
+        attn_weights = nn.softmax(scores, axis=-1)
+        
+        # Apply input attention mask after softmax to prevent NaN issues
         if attn_mask is not None and attn_mask.ndim == 2 and attn_mask.shape[0] == batch_size:
             if attn_mask.shape[1] > seq_len:
                 attn_mask = attn_mask[:, :seq_len]
@@ -133,8 +136,8 @@ class Router(nn.Module):
     num_experts: int
     z_loss_coef: float = 1e-3
     balance_loss_coef: float = 1e-2
-    confidence_loss_coef: float = 1e-2
-    entropy_loss_coef: float = 5e-3
+    confidence_loss_coef: float = 1e-4
+    entropy_loss_coef: float = 1e-4
     dtype: jnp.dtype = jnp.bfloat16
     training: bool = False
     use_gradient_checkpointing: bool = False
@@ -155,17 +158,19 @@ class Router(nn.Module):
             (1,),
             self.dtype
         )
-
-    def __call__(self, x, expert_capacity: int, use_mask_routing: bool = False):
+    
+    def expert_choose_tokens(self, x, expert_capacity: int):
         num_groups, group_size, _ = x.shape
         total_tokens = num_groups * group_size
         
         router_logits = self.gate(x)
+        
         safe_temp = jnp.maximum(self.temperature, 0.1)
         router_probs = jax.nn.softmax(router_logits / safe_temp, axis=-1)
         
         if self.training:
             expert_usage = jnp.sum(router_probs, axis=(0, 1)) / (total_tokens + 1e-5)
+            
             entropy = -jnp.sum(router_probs * jnp.log(router_probs + 1e-5), axis=-1)
             mean_entropy = jnp.mean(entropy)
             target_entropy = 0.5 * jnp.log(self.num_experts)
@@ -173,7 +178,10 @@ class Router(nn.Module):
             
             target_usage = 1.0 / self.num_experts
             usage_loss = jnp.mean(jnp.square(expert_usage - target_usage))
-            confidence_loss = jnp.mean(1.0 - jnp.max(router_probs, axis=-1))
+            
+            confidence = jnp.max(router_probs, axis=-1)
+            confidence_loss = jnp.mean(1.0 - confidence)
+            
             router_z_loss = jnp.mean(jnp.square(jax.nn.logsumexp(router_logits, axis=-1)))
             
             loss = (
@@ -182,51 +190,37 @@ class Router(nn.Module):
                 entropy_loss * self.entropy_loss_coef +
                 router_z_loss * self.z_loss_coef
             )
-            
-            noise = jax.random.normal(
-                self.make_rng('noise'),
-                router_probs.shape,
-                dtype=router_probs.dtype
-            ) * 0.01
-            router_probs = nn.softmax(jnp.log(router_probs + 1e-5) + noise)
         else:
             loss = 0.0
         
         flat_probs = router_probs.transpose(2, 0, 1).reshape(self.num_experts, -1)
-        scores, token_indices = jax.lax.top_k(flat_probs, k=expert_capacity)
+
+        safe_expert_capacity = min(expert_capacity, flat_probs.shape[-1])
+        
+        scores, token_indices = jax.lax.top_k(flat_probs, k=safe_expert_capacity)
         
         group_indices = token_indices // group_size
         pos_indices = token_indices % group_size
+
+        return jnp.stack([group_indices, pos_indices], axis=-1), scores, loss
+
+    def token_choose_experts(self, x, experts_top_k: int):
+        # x: [batch_size * seq_len, d_model]
+        total_tokens, _ = x.shape
         
-        if use_mask_routing:
-            expert_masks = jnp.zeros((self.num_experts, num_groups, group_size), dtype=jnp.bool_)
-            weight_masks = jnp.zeros((self.num_experts, num_groups, group_size), dtype=self.dtype)
-            
-            batch_indices = jnp.broadcast_to(
-                jnp.arange(self.num_experts)[:, None],
-                (self.num_experts, expert_capacity)
-            )
-            
-            scatter_indices = jnp.stack([
-                batch_indices.reshape(-1),
-                group_indices.reshape(-1),
-                pos_indices.reshape(-1)
-            ], axis=1)
-            
-            expert_masks = expert_masks.at[
-                scatter_indices[:, 0],
-                scatter_indices[:, 1],
-                scatter_indices[:, 2]
-            ].set(True)
-            weight_masks = weight_masks.at[
-                scatter_indices[:, 0],
-                scatter_indices[:, 1],
-                scatter_indices[:, 2]
-            ].set(scores.reshape(-1))
-            
-            return expert_masks, weight_masks, loss
-        else:
-            return jnp.stack([group_indices, pos_indices], axis=-1), scores, loss
+        router_logits = self.gate(x)
+        
+        safe_temp = jnp.maximum(self.temperature, 0.1)
+        router_probs = jax.nn.softmax(router_logits / safe_temp, axis=-1)
+
+        # Get top-k expert indices and probabilities for each token
+        top_k_probs, top_k_indices = jax.lax.top_k(router_probs, k=experts_top_k)
+        
+        # Renormalize the top-k probabilities
+        top_k_probs_sum = jnp.sum(top_k_probs, axis=-1, keepdims=True)
+        top_k_weights = top_k_probs / (top_k_probs_sum + 1e-9)
+
+        return top_k_indices, top_k_weights
 
 class JumpModule(nn.Module):
     """Jump module that can return trainable constant, or random noise"""
@@ -253,7 +247,7 @@ class ExpertsFeedForward(nn.Module):
     num_shared_experts: int
     num_constant_experts: int = 0
     num_noise_experts: int = 0
-    expert_capacity_factor: float = 1.0
+    expert_capacity_factor: float = 2.0
     min_expert_capacity: int = 8
     max_group_size: int = 4096
     dtype: jnp.dtype = jnp.bfloat16
@@ -309,32 +303,44 @@ class ExpertsFeedForward(nn.Module):
         return experts
 
     def _compute_group_size(self, batch_size, seq_len):
-        num_tokens = batch_size * seq_len
-        min_num_groups = max(1, (num_tokens + self.max_group_size - 1) // self.max_group_size)
+        """Compute group size and related parameters in a JIT-compatible way."""
+        # Convert dynamic values to static integers where possible
+        num_tokens = int(batch_size * seq_len)
         
-        def gcd(a, b):
-            while b:
-                a, b = b, a % b
-            return a
+        # Calculate target group size using static operations
+        sqrt_tokens = int(float(num_tokens) ** 0.5)
+        target_group_size = min(
+            self.max_group_size,
+            max(32, sqrt_tokens)
+        )
         
-        if num_tokens % min_num_groups == 0:
-            num_groups = min_num_groups
-        else:
-            divisor = num_tokens // gcd(num_tokens, min_num_groups)
-            if divisor >= min_num_groups:
-                num_groups = divisor
-            else:
-                num_groups = ((min_num_groups + divisor - 1) // divisor) * divisor
-                if num_groups > 2 * min_num_groups:
-                    num_groups = min_num_groups
+        # Calculate number of groups needed
+        num_groups = (num_tokens + target_group_size - 1) // target_group_size
+        group_size = target_group_size
         
-        group_size = num_tokens // num_groups
-        if group_size > self.max_group_size:
-            group_size = self.max_group_size
-            num_groups = (num_tokens + group_size - 1) // group_size
-            group_size = num_tokens // num_groups
+        # Calculate total tokens and expert capacity
+        total_tokens = num_groups * group_size
+        tokens_per_expert = total_tokens / max(1, self.num_experts)
         
-        return group_size, num_groups
+        # Calculate capacity with factor using static operations
+        capacity_from_factor = int(self.expert_capacity_factor * tokens_per_expert)
+        
+        # Set minimum capacity
+        min_capacity = max(
+            max(self.min_expert_capacity, group_size),
+            int(total_tokens * 0.001)
+        )
+        
+        # Set maximum capacity
+        max_capacity = min(
+            group_size * 32,
+            int(total_tokens * 0.1)
+        )
+        
+        # Final expert capacity
+        expert_capacity = min(max_capacity, max(capacity_from_factor, min_capacity))
+        
+        return group_size, num_groups, expert_capacity
 
     def _process_shared_experts(self, x):
         if not self.shared_experts:
@@ -342,55 +348,47 @@ class ExpertsFeedForward(nn.Module):
         return jnp.mean(jnp.stack([
             jax.vmap(expert)(x) for expert in self.shared_experts
         ]), axis=0) if len(self.shared_experts) > 1 else jax.vmap(self.shared_experts[0])(x)
+    
+    def _expert_choose_tokens(self, x):
+        batch_size, seq_len, _ = x.shape
+        group_size, num_groups, expert_capacity = self._compute_group_size(batch_size, seq_len)
+        
+        # Calculate total size after grouping
+        total_size = num_groups * group_size
+        original_size = batch_size * seq_len
+        
+        # Reshape and pad input to grouped form
+        x_flat = x.reshape(-1, self.d_model)
+        padding_needed = total_size - original_size
+        x_padded = jnp.pad(
+            x_flat,
+            pad_width=((0, padding_needed), (0, 0)),
+            mode='constant',
+            constant_values=0
+        )
+        x_grouped = x_padded.reshape(num_groups, group_size, self.d_model)
+        
+        expert_indices, routing_weights, router_loss = self.router.expert_choose_tokens(x_grouped, expert_capacity)
+        output = self._process_shared_experts(x_grouped)
 
-    def _process_routed_experts_inference(self, x, expert_indices, routing_weights):
-        output = jnp.zeros_like(x)
+        # routing experts
+        experts_output = jnp.zeros_like(x)
         for expert_idx, expert in enumerate(self.experts):
             indices = expert_indices[expert_idx]
             weights = routing_weights[expert_idx]
             tokens = x[indices[:, 0], indices[:, 1]]
             processed = jax.vmap(expert)(tokens) * weights[:, None]
-            output = output.at[indices[:, 0], indices[:, 1]].add(processed)
-        return output
-    
-    def _process_routed_experts_training(self, x, expert_masks, weight_masks):
-        output = jnp.zeros_like(x)
-        for expert_idx, expert in enumerate(self.experts):
-            mask = expert_masks[expert_idx]
-            weights = weight_masks[expert_idx]
-            masked_input = x * mask[:, :, None]
-            processed = jax.vmap(jax.vmap(expert))(masked_input)
-            output += processed * weights[:, :, None]
-        return output
+            experts_output = experts_output.at[indices[:, 0], indices[:, 1]].add(processed)
+        output = output + experts_output
+        
+        # Remove padding by reshaping and slicing
+        output_flat = output.reshape(-1, self.d_model)[:original_size]
+        output = output_flat.reshape(batch_size, seq_len, self.d_model)
+        
+        return output, router_loss
 
     def __call__(self, x):
-        batch_size, seq_len, _ = x.shape
-        group_size, num_groups = self._compute_group_size(batch_size, seq_len)
-        
-        if batch_size * seq_len == num_groups * group_size:
-            x_grouped = x.reshape(num_groups, group_size, self.d_model)
-        else:
-            padded_size = num_groups * group_size
-            padding = padded_size - (batch_size * seq_len)
-            x_flat = x.reshape(-1, self.d_model)
-            x_padded = jnp.pad(x_flat, ((0, padding), (0, 0)))
-            x_grouped = x_padded.reshape(num_groups, group_size, self.d_model)
-        
-        safe_num_experts = max(1, self.num_experts)
-        capacity_from_factor = int(round(self.expert_capacity_factor * group_size / safe_num_experts))
-        min_capacity = max(1, self.min_expert_capacity, group_size // 100)
-        expert_capacity = max(capacity_from_factor, min_capacity)
-        
-        if self.training:
-            expert_masks, weight_masks, router_loss = self.router(x_grouped, expert_capacity, use_mask_routing=True)
-            output = self._process_shared_experts(x_grouped)
-            output += self._process_routed_experts_training(x_grouped, expert_masks, weight_masks)
-        else:
-            expert_indices, routing_weights, router_loss = self.router(x_grouped, expert_capacity)
-            output = self._process_shared_experts(x_grouped)
-            output += self._process_routed_experts_inference(x_grouped, expert_indices, routing_weights)
-        
-        return output.reshape(batch_size, seq_len, self.d_model), router_loss
+        return self._expert_choose_tokens(x)
 
 class Block(nn.Module):
     """Transformer block with attention and MoE feed-forward layers."""
@@ -439,7 +437,7 @@ class Block(nn.Module):
 
 class Transformer(nn.Module):
     """Transformer model with MoE layers."""
-    num_layers: int
+    num_blocks: int
     num_heads: int
     d_model: int
     hidden_size: int
@@ -474,7 +472,7 @@ class Transformer(nn.Module):
                 dtype=self.dtype,
                 use_gradient_checkpointing=self.use_gradient_checkpointing,
                 training=self.training,
-            ) for i in range(self.num_layers)
+            ) for i in range(self.num_blocks)
         ]
         self.final_norm = nn.RMSNorm(dtype=self.dtype)
         self.lm_head = nn.Dense(self.vocab_size, dtype=self.dtype)

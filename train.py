@@ -14,8 +14,6 @@ from transformers import AutoTokenizer
 from flax.training import train_state
 from typing import Dict, Tuple
 from functools import partial
-from flax import jax_utils
-from flax.training import checkpoints
 from tqdm import tqdm
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 import wandb
@@ -23,13 +21,14 @@ from jax.experimental.multihost_utils import sync_global_devices
 import numpy as np
 import collections
 import itertools
-
+import orbax.checkpoint as ocp
+from flax.training import orbax_utils
 # This script trains a Transformer model with MoE (Mixture of Experts) architecture
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
 
 # Constants
 CONTEXT_LENGTH = 256
-BATCH_SIZE = 8
+BATCH_SIZE = 4
 NUM_EPOCHS = 5
 LEARNING_RATE = 1e-5
 WARMUP_STEPS = 100
@@ -37,7 +36,7 @@ GRADIENT_CLIP_NORM = 0.5
 BATCH_MESH_SIZE = 4
 DTYPE = jnp.bfloat16  # Set default dtype to bfloat16
 PARALLEL_PROCESSING = 16
-TOKENIZED_DATASET_PATH = '/mnt/dataset/tokenized_dataset'
+TOKENIZED_DATASET_PATH = './tokenized_dataset'
 
 vocab_size = 50257
 vocab_size = ((vocab_size + 127) // 128) * 128
@@ -151,7 +150,7 @@ def create_train_state(
     with mesh:
         print("Transferring parameters to mesh...")
         param_shardings = jax.tree.map_with_path(
-            lambda path, p: NamedSharding(mesh, get_param_spec(p, path)),
+            lambda path, p: NamedSharding(mesh, get_param_spec_validated(p, path)),
             cpu_variables['params']
         )
         
@@ -250,41 +249,31 @@ def create_batch(mesh, inputs):
         else:
             examples[k] = jnp.array(v)
     
-    mesh_axes = mesh.axis_names
-    has_expert_dim = 'expert' in mesh_axes
-    
     if isinstance(examples, dict):
         sharded_examples = {}
         for key, value in examples.items():
             if hasattr(value, 'ndim'):
                 ndim = value.ndim
-                spec = get_sharding_spec(ndim, has_expert_dim)
+                spec = get_sharding_spec(ndim)
                 sharded_examples[key] = jax.device_put(value, NamedSharding(mesh, spec))
             else:
                 sharded_examples[key] = value
         return sharded_examples
     else:
         if hasattr(examples, 'ndim'):
-            spec = get_sharding_spec(examples.ndim, has_expert_dim)
+            spec = get_sharding_spec(examples.ndim)
             return jax.device_put(examples, NamedSharding(mesh, spec))
         return examples
 
-def get_sharding_spec(ndim: int, has_expert_dim: bool) -> P:
+def get_sharding_spec(ndim: int) -> P:
     """Helper function to determine sharding spec based on tensor rank."""
-    if has_expert_dim:
-        if ndim == 3:
-            return P('expert', 'model', 'batch')
-        elif ndim == 2:
-            return P('model', 'batch')
-        elif ndim == 1:
-            return P('model')
+    if ndim == 3:
+        return P('expert', 'model', 'batch')
+    elif ndim == 2:
+        return P('expert', 'model')
+    elif ndim == 1:
         return P(None)
-    else:
-        if ndim >= 2:
-            return P('batch', None)
-        elif ndim == 1:
-            return P(None)
-        return P(None)
+    return P(None)
 
 @jax.jit
 def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], step: int, rngs: jax.random.PRNGKey):
@@ -329,33 +318,20 @@ def create_mesh():
     n_devices = len(devices)
     num_experts = MODEL_CONFIG['num_experts']
     
-    factors = [
-        (i, n_devices // i)
-        for i in range(1, int(n_devices**0.5) + 1)
-        if n_devices % i == 0
-    ]
+    expert_dim = max(
+        (i for i in range(1, min(num_experts, n_devices) + 1) if n_devices % i == 0),
+        default=1
+    )
+    remaining_devices = n_devices // expert_dim
     
-    if n_devices >= 8:
-        expert_dim = max(
-            (i for i in range(1, min(num_experts, n_devices) + 1) if n_devices % i == 0),
-            default=1
-        )
-        remaining_devices = n_devices // expert_dim
-        
-        model_dim = max(1, int(remaining_devices**0.5))
-        while remaining_devices % model_dim != 0:
-            model_dim -= 1
-        
-        batch_dim = remaining_devices // model_dim
-        mesh_shape = (expert_dim, model_dim, batch_dim)
-        mesh = jax.make_mesh(mesh_shape, ('expert', 'model', 'batch'))
-        print(f"Using 3D mesh with shape: expert={expert_dim}, model={model_dim}, batch={batch_dim}")
-    else:
-        model_dim = max(factors, key=lambda x: abs(x[0] - x[1]))[0]
-        batch_dim = n_devices // model_dim
-        mesh_shape = (model_dim, batch_dim)
-        mesh = jax.make_mesh(mesh_shape, ('model', 'batch'))
-        print(f"Using 2D mesh with shape: model={model_dim}, batch={batch_dim}")
+    model_dim = max(1, int(remaining_devices**0.5))
+    while remaining_devices % model_dim != 0:
+        model_dim -= 1
+    batch_dim = remaining_devices // model_dim
+    mesh_shape = (expert_dim, model_dim, batch_dim)
+    mesh = jax.make_mesh(mesh_shape, ('expert', 'model', 'batch'))
+
+    print(f"Using 3D mesh with shape: expert={expert_dim}, model={model_dim}, batch={batch_dim}")
     
     return mesh, n_devices
 
@@ -363,84 +339,123 @@ def get_param_spec(param, path):
     """Get parameter sharding specification based on parameter path and shape."""
     path_str = str(path).lower()
     
-    # Check if we're using a 3D mesh with expert dimension
-    mesh_axes = jax.devices().mesh_axes if hasattr(jax.devices(), 'mesh_axes') else None
-    has_expert_dim = mesh_axes is not None and 'expert' in mesh_axes
-    
     # Handle 1D parameters (biases, scales, etc.)
     if param.ndim == 1:
         # For larger 1D parameters (>10k elements), shard across model dimension
         if param.size > 10000:
-            return P('model')
-        # For smaller 1D parameters, replicate
+            return P(None, 'model', None)
+        # For smaller 1D parameters, replicate across all dimensions
         return P(None)
     
     # Handle expert-related parameters
     if 'experts' in path_str:
-        if has_expert_dim:
-            if 'keys' in path_str or 'values' in path_str:
-                if 'kernel' in path_str:
-                    return P('expert', 'model', None)
-                elif 'bias' in path_str:
-                    return P('expert', None, None)
-            elif 'jump' in path_str:
-                return P('expert', None, None)
-        else:
+        if 'keys' in path_str or 'values' in path_str:
             if 'kernel' in path_str:
-                return P('model', 'batch')
-            return P('model')
+                return P('expert', 'model', None)
+            elif 'bias' in path_str:
+                return P('expert')
+        elif 'jump' in path_str:
+            return P('expert')
     
     # Router parameters
     if 'router' in path_str:
         if 'gate' in path_str:
             if 'kernel' in path_str:
-                return P('expert', 'model', None) if has_expert_dim else P('model', None)
+                # Router gate kernels are 2D (input_dim, num_experts)
+                if param.ndim == 2:
+                    return P('expert', 'model')
+                return P(None, 'model', None)
             elif 'bias' in path_str:
-                return P('expert', None) if has_expert_dim else P(None)
+                return P(None)
         elif 'temperature' in path_str:
-            return P(None)  # Always replicate temperature parameter
+            return P(None)
     
     # Output projection and embedding layers
-    if 'output_proj' in path_str:
+    if 'output_proj' in path_str or 'lm_head' in path_str or 'out_proj' in path_str:
         if 'kernel' in path_str:
-            return P('expert', 'model', 'batch') if has_expert_dim else P('model', 'batch')
-        elif 'bias' in path_str and param.size > 10000:
-            return P('model')
-        return P(None)
+            if param.ndim == 2:
+                return P('expert', 'model')
+            return P(None, 'model', None)
+        elif 'bias' in path_str:
+            return P(None)
     
-    if 'token_embedding' in path_str and 'embedding' in path_str:
-        return P('expert', 'model', None) if has_expert_dim else P('model', None)
+    if 'embedding' in path_str:
+        if param.ndim == 2:
+            return P('expert', 'model')
+        return P(None, 'model', None)
     
     # Attention layers
     if 'attention' in path_str:
-        if has_expert_dim:
-            if 'q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str:
-                if 'kernel' in path_str:
-                    return P('expert', None, 'model')
-                return P(None)
-            if 'out_proj' in path_str:
-                if 'kernel' in path_str:
-                    return P('expert', 'model', None)
-                return P(None)
-        else:
+        if 'q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str:
             if 'kernel' in path_str:
-                return P('model', 'batch')
-            return P(None)
+                if param.ndim == 2:
+                    return P('expert', 'model')
+                return P(None, 'model', None)
+            elif 'bias' in path_str:
+                return P(None)
+        if 'out_proj' in path_str:
+            if 'kernel' in path_str:
+                if param.ndim == 2:
+                    return P('expert', 'model')
+                return P(None, 'model', None)
+            elif 'bias' in path_str:
+                return P(None)
     
     # Layer normalization parameters
     if 'norm' in path_str or 'layernorm' in path_str or 'rmsnorm' in path_str:
-        return P(None)  # Always replicate normalization parameters
+        return P(None)
     
     # Size-based fallbacks
     if param.size < 10000:
         return P(None)
     
     # Default for remaining 2D+ parameters
-    if param.ndim >= 2:
-        return P('model', 'batch') if not has_expert_dim else P('expert', 'model', None)
+    if param.ndim == 2:
+        return P('expert', 'model')
+    elif param.ndim >= 3:
+        return P(None, 'model', None)
     
     # Default fallback for any other parameters
     return P(None)
+
+def validate_param_spec(param, spec):
+    """Validate that the parameter sharding specification is compatible with the parameter shape."""
+    if spec is None:
+        return True
+    
+    # Count non-None axes in the spec
+    non_none_axes = sum(1 for axis in spec if axis is not None)
+    
+    # Check if the number of non-None axes matches the parameter ndim
+    if non_none_axes > param.ndim:
+        return False
+    
+    # For 1D parameters, ensure we don't have a 3D spec
+    if param.ndim == 1 and len(spec) > 1:
+        return False
+    
+    # For 2D parameters, ensure we don't have a 3D spec
+    if param.ndim == 2 and len(spec) > 2:
+        return False
+    
+    return True
+
+def get_param_spec_validated(param, path):
+    """Get validated parameter sharding specification."""
+    spec = get_param_spec(param, path)
+    if not validate_param_spec(param, spec):
+        path_str = '/'.join(str(p) for p in path)
+        print(f"Warning: Invalid sharding spec for {path_str} with shape {param.shape}: {spec}")
+        # Fall back to a safe sharding spec
+        if param.ndim == 0:
+            return P(None)
+        elif param.ndim == 1:
+            return P(None)
+        elif param.ndim == 2:
+            return P('expert', 'model')
+        else:
+            return P(None, 'model', 'batch')
+    return spec
 
 def prefetch(iterator, size):
     """Creates a prefetch queue for the iterator."""
@@ -507,6 +522,10 @@ def main():
     print(f"Syncing mesh for process {jax.process_index()}")
     sync_global_devices('mesh_created')
 
+    # Initialize async checkpoint manager
+    async_checkpointer = ocp.AsyncCheckpointer(ocp.PyTreeCheckpointHandler(), timeout_secs=50)
+    async_checkpoint_manager = ocp.CheckpointManager(CHECKPOINT_DIR, async_checkpointer, options=ocp.CheckpointManagerOptions(enable_async_checkpointing=True, max_to_keep=2))
+
     samples_per_step = BATCH_SIZE * BATCH_MESH_SIZE
     steps_per_epoch = len(tokenized_dataset) // samples_per_step
     total_steps = steps_per_epoch * NUM_EPOCHS
@@ -527,7 +546,6 @@ def main():
         rng, init_rng = jax.random.split(rng)
 
         step = 0
-        latest_checkpoint = checkpoints.latest_checkpoint(CHECKPOINT_DIR)
         state = create_train_state(
             init_rng,
             mesh=mesh,
@@ -538,19 +556,16 @@ def main():
         print(f"Syncing training state for process {jax.process_index()}")
         sync_global_devices('training_state_created')
 
-        if latest_checkpoint:
-            print(f"Found checkpoint at {latest_checkpoint}. Restoring...")
-            try:
-                checkpoint_step = int(os.path.basename(latest_checkpoint).split("_")[-1])
-                step = checkpoint_step
-                state = checkpoints.restore_checkpoint(latest_checkpoint, target=state)
-                print(f"Successfully restored checkpoint at step {step}")
-            except Exception as e:
-                print(f"Error loading checkpoint: {e}")
-                print("Training from scratch instead.")
-                step = 0
+        # Restore from checkpoint
+        restore_args = orbax_utils.restore_args_from_target(state)
+        latest_step = async_checkpoint_manager.latest_step()
+        if latest_step is not None:
+            print(f"Restoring from checkpoint at step {latest_step}")
+            step = latest_step
+            state = async_checkpoint_manager.restore(latest_step, items=state, restore_kwargs={'restore_args': restore_args})
+            async_checkpoint_manager.wait_until_finished()
         else:
-            print("No checkpoint found. Training from scratch.")
+            print("No checkpoint found, training from scratch")
 
         print(f"Syncing checkpoint loaded for process {jax.process_index()}")
         sync_global_devices('checkpoint_loaded')
@@ -614,12 +629,8 @@ def main():
 
                     if (batch_idx % 5000 == 0 or step % 5000 == 0) and step != 0:
                         print(f"\nSaving checkpoint at step {step}...")
-                        checkpoints.save_checkpoint_multiprocess(
-                            ckpt_dir=CHECKPOINT_DIR,
-                            target=state,
-                            step=step,
-                            overwrite=True
-                        )
+                        async_checkpoint_manager.save(step, state)
+                        async_checkpoint_manager.wait_until_finished()
                         print(f"Checkpoint saved at {os.path.join(CHECKPOINT_DIR, f'checkpoint_{step}')}")
 
                     step += 1
