@@ -44,7 +44,7 @@ def test_autoregressive_generation():
     batch_size = 1
     
     # Create prompt
-    prompt = "Move"
+    prompt = "Can you tell me"
     input_tokens = tokenizer(prompt, return_tensors="np")
     input_ids = jnp.array(input_tokens["input_ids"])
     prompt_length = input_ids.shape[1]

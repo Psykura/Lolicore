@@ -130,7 +130,7 @@ class MultiHeadAttention(nn.Module):
         return output
 
 class FeedForward(nn.Module):
-    """Feed-forward network that processes multiple experts in parallel."""
+    """Feed-forward network that processes multiple experts in parallel with separate parameters."""
     hidden_size: int
     d_model: int
     num_experts: int = 1  # Number of parallel experts
@@ -138,27 +138,27 @@ class FeedForward(nn.Module):
     use_gradient_checkpointing: bool = False
     
     def setup(self):
-        dense_impl = nn.remat(nn.Dense) if self.use_gradient_checkpointing else nn.Dense
-        # Each expert has its own weights but processed in parallel
-        self.keys = dense_impl(features=self.hidden_size * self.num_experts, dtype=self.dtype)
-        self.values = dense_impl(features=self.d_model * self.num_experts, dtype=self.dtype)
+        self.keys = self.param('keys', nn.initializers.normal(0.02), (self.num_experts, self.hidden_size, self.d_model))
+        self.values = self.param('values', nn.initializers.normal(0.02), (self.num_experts, self.d_model, self.hidden_size))
         self.activation = nn.gelu
 
     def __call__(self, x):
-        _, seq_len, _, _ = x.shape
-        # x [batch, seq, num_experts, d_model]
-
-        x = x.reshape(-1, seq_len, self.num_experts * self.d_model)
-
-        hidden = self.keys(x)  # [batch, seq, hidden_size * num_experts]
-
-        hidden = self.activation(hidden)
-
-        output = self.values(hidden)  # [batch, seq, d_model * num_experts]
-
-        output = output.reshape(-1, seq_len, self.num_experts, self.d_model)
+        # x shape: [batch, seq, num_experts, d_model]
         
-        return output  # [batch, seq, num_experts, d_model]
+        # First projection: x @ keys
+        # [batch, seq, num_experts, d_model] @ [num_experts, hidden_size, d_model] 
+        # -> [batch, seq, num_experts, hidden_size]
+        hidden = jnp.einsum('bsed,ehd->bseh', x, self.keys)
+        
+        # Apply activation
+        hidden = self.activation(hidden)
+        
+        # Second projection: hidden @ values
+        # [batch, seq, num_experts, hidden_size] @ [num_experts, d_model, hidden_size] 
+        # -> [batch, seq, num_experts, d_model]
+        output = jnp.einsum('bseh,edh->bsed', hidden, self.values)
+        
+        return output
 
 # ref to astralord/jax_parallel
 class Router(nn.Module):
@@ -184,9 +184,28 @@ class Router(nn.Module):
             jnp.mean(gating_probs, axis=1) * jnp.mean(combined_expert_mask, axis=1)
         ) * (jnp.mean(combined_expert_mask, axis=1).shape[-1] ** 2)
     
+    def z_loss(self, gating_logits):
+        """
+        Compute auxiliary z-loss for router logits.
+        
+        This loss penalizes large logit values to prevent numerical instability
+        in the softmax operation.
+        
+        Args:
+            gating_logits: Raw logits from router, shape [G, S, E]
+            
+        Returns:
+            z_loss: Scalar loss value
+        """
+        # Calculate log-sum-exp of logits
+        log_z = jax.nn.logsumexp(gating_logits, axis=-1)
+        # Square and mean across all tokens
+        z_loss = jnp.mean(log_z ** 2)
+        return z_loss
+    
     def __call__(self, x, expert_capacity: int):
         # Compute gating probabilities for each token: shape [G, S, E]
-        gating_logits = self.gate(x)
+        gating_logits = self.gate(x)        
         gating_probs = jax.nn.softmax(gating_logits)
 
         # expert_gate: [G, S, top_k] with the top_k probabilities.
@@ -198,7 +217,13 @@ class Router(nn.Module):
 
         # Shape: [G, S, E]
         combined_expert_mask = jnp.sum(expert_mask, axis=2)
-        loss = self.load_balance_loss(gating_probs, combined_expert_mask)
+
+        if self.training:
+            router_z_loss = self.z_loss(gating_logits)
+            router_balance_loss = self.load_balance_loss(gating_probs, combined_expert_mask)
+            loss = router_balance_loss * self.balance_loss_coef + router_z_loss * self.z_loss_coef
+        else:
+            loss = 0.0
 
         # Shape: [G, S, top_k, E]
         position_in_expert = jnp.cumsum(expert_mask, axis=1) * expert_mask
@@ -270,6 +295,7 @@ class ExpertsFeedForward(nn.Module):
     expert_capacity_factor: float = 2.0
     min_expert_capacity: int = 8
     max_group_size: int = 4096
+    top_k: int = 4
     dtype: jnp.dtype = jnp.bfloat16
     training: bool = False
     use_gradient_checkpointing: bool = False
@@ -283,7 +309,8 @@ class ExpertsFeedForward(nn.Module):
             num_experts=self.num_experts,
             dtype=self.dtype,
             training=self.training,
-            use_gradient_checkpointing=self.use_gradient_checkpointing
+            use_gradient_checkpointing=self.use_gradient_checkpointing,
+            top_k=self.top_k
         )
         
         # Single instance for all feedforward experts
@@ -466,6 +493,7 @@ class Block(nn.Module):
     num_shared_experts: int = 1
     num_constant_experts: int = 0
     num_noise_experts: int = 0
+    top_k: int = 4
     dtype: jnp.dtype = jnp.bfloat16
     use_gradient_checkpointing: bool = False
     training: bool = False
@@ -489,6 +517,7 @@ class Block(nn.Module):
             num_shared_experts=self.num_shared_experts,
             num_constant_experts=self.num_constant_experts,
             num_noise_experts=self.num_noise_experts,
+            top_k=self.top_k,
             dtype=self.dtype,
             training=self.training,
             use_gradient_checkpointing=self.use_gradient_checkpointing
@@ -514,6 +543,7 @@ class Transformer(nn.Module):
     num_shared_experts: int = 1
     num_constant_experts: int = 0
     num_noise_experts: int = 0
+    top_k: int = 4
     dtype: jnp.dtype = jnp.bfloat16
     use_gradient_checkpointing: bool = False
     training: bool = False
@@ -535,6 +565,7 @@ class Transformer(nn.Module):
                 num_shared_experts=self.num_shared_experts,
                 num_constant_experts=self.num_constant_experts,
                 num_noise_experts=self.num_noise_experts,
+                top_k=self.top_k,
                 dtype=self.dtype,
                 use_gradient_checkpointing=self.use_gradient_checkpointing,
                 training=self.training,
@@ -551,6 +582,7 @@ class Transformer(nn.Module):
         for block in self.blocks:
             x, router_loss = block(x, attn_mask)
             total_router_loss += router_loss
+        total_router_loss = total_router_loss / self.num_blocks
 
         x = self.final_norm(x)
         logits = self.lm_head(x)

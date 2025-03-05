@@ -21,12 +21,12 @@ import orbax.checkpoint as ocp
 
 # Constants
 CONTEXT_LENGTH = 256
-BATCH_SIZE = 32
+BATCH_SIZE = 8
 NUM_EPOCHS = 5
 LEARNING_RATE = 1e-4
-WARMUP_STEPS = 1000
+WARMUP_STEPS = 100
 GRADIENT_CLIP_NORM = 0.5
-BATCH_MESH_SIZE = 4
+BATCH_MESH_SIZE = 2
 DTYPE = jnp.bfloat16  # Set default dtype to bfloat16
 PARALLEL_PROCESSING = 16
 TOKENIZED_DATASET_PATH = './tokenized_dataset'
@@ -42,12 +42,13 @@ MODEL_CONFIG = {
     'hidden_size': 4096,
     'max_seq_length': CONTEXT_LENGTH,
     'vocab_size': vocab_size,  # GPT-2 vocab size
-    'num_experts': 8,
+    'num_experts': 16,
     'num_shared_experts': 1,
     'use_gradient_checkpointing': True,
-    'attention_latent_dim': 32,
-    'num_constant_experts': 2,
-    'num_noise_experts': 0,
+    'attention_latent_dim': 64,
+    'num_constant_experts': 4,
+    'num_noise_experts': 1,
+    'top_k': 2,
 }
 
 # Dataset configuration
@@ -86,10 +87,10 @@ def debug_param_sharding(params, param_shardings):
     print("\nParameter Sharding Debug Information")
     print(f"{'Parameter Path':<60} {'Shape':<20} {'Size (MB)':<12} {'Sharding':<15}")
     print("-" * 107)
-    
+
     flat_params = jax.tree_util.tree_flatten_with_path(params)[0]
     flat_shardings = jax.tree_util.tree_flatten_with_path(param_shardings)[0]
-    
+
     param_info = []
     for (path, param), (_, sharding) in zip(flat_params, flat_shardings):
         path_str = '.'.join(str(p) for p in path)
@@ -100,12 +101,12 @@ def debug_param_sharding(params, param_shardings):
             size_mb,
             str(sharding.spec)
         ))
-    
+
     total_size_mb = 0
     for path_str, shape_str, size_mb, sharding_str in sorted(param_info, key=lambda x: x[2], reverse=True):
         print(f"{path_str:<60} {shape_str:<20} {size_mb:<12.2f} {sharding_str:<15}")
         total_size_mb += size_mb
-    
+
     print("-" * 107)
     print(f"Total parameter size: {total_size_mb:.2f} MB\n")
 
@@ -124,7 +125,7 @@ def create_train_state(
     cpu_device = jax.devices("cpu")[0]
     cpu_dummy_input = jax.device_put(jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32), cpu_device)
     cpu_dummy_mask = jax.device_put(jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32), cpu_device)
-    
+
     with jax.default_device(cpu_device):
         cpu_variables = model.init(rngs, cpu_dummy_input, cpu_dummy_mask)
     print("CPU initialization complete")
@@ -146,7 +147,7 @@ def create_train_state(
             lambda path, p: NamedSharding(mesh, get_param_spec_validated(p, path)),
             cpu_variables['params']
         )
-        
+
         if jax.process_index() == 0:
             print("Parameters with inconsistent dimensions:")
             jax.tree.map_with_path(
@@ -158,7 +159,7 @@ def create_train_state(
 
         sharded_params = jax.device_put(cpu_variables['params'], param_shardings)
         print("Parameter transfer complete")
-        
+
         return train_state.TrainState.create(
             apply_fn=model.apply,
             params=sharded_params,
@@ -198,7 +199,7 @@ def prepare_dataset(tokenizer):
                 chunk = input_ids[i:i + CONTEXT_LENGTH]
                 if len(chunk) < 32:
                     continue
-                    
+
                 if len(chunk) < CONTEXT_LENGTH:
                     padding_length = CONTEXT_LENGTH - len(chunk)
                     attention_mask = [1] * len(chunk) + [0] * padding_length
@@ -241,7 +242,7 @@ def create_batch(mesh, inputs):
             examples[k] = jnp.array(masks)
         else:
             examples[k] = jnp.array(v)
-    
+
     if isinstance(examples, dict):
         sharded_examples = {}
         for key, value in examples.items():
@@ -284,12 +285,12 @@ def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], ste
         loss_mask = batch['attention_mask'][..., :-1]
         shift_logits = logits[..., :-1, :].astype(jnp.float32)
         shift_labels = batch['labels'][..., 1:]
-        
+
         main_loss = optax.softmax_cross_entropy_with_integer_labels(
             shift_logits,
             shift_labels,
         )
-        
+
         main_loss = (main_loss * loss_mask).sum() / (loss_mask.sum() + 1e-9)
         total_loss = main_loss + router_loss
 
@@ -309,29 +310,21 @@ def create_mesh():
     """Create an optimized device mesh for training MoE models."""
     devices = jax.devices()
     n_devices = len(devices)
-    num_experts = MODEL_CONFIG['num_experts']
+
+    expert_dim = 4
+    model_dim = 2
+    batch_dim = n_devices // (expert_dim * model_dim)
     
-    expert_dim = max(
-        (i for i in range(1, min(num_experts, n_devices) + 1) if n_devices % i == 0),
-        default=1
-    )
-    remaining_devices = n_devices // expert_dim
-    
-    model_dim = max(1, int(remaining_devices**0.5))
-    while remaining_devices % model_dim != 0:
-        model_dim -= 1
-    batch_dim = remaining_devices // model_dim
-    mesh_shape = (expert_dim, model_dim, batch_dim)
-    mesh = jax.make_mesh(mesh_shape, ('expert', 'model', 'batch'))
+    mesh = jax.make_mesh((expert_dim, model_dim, batch_dim), ('expert', 'model', 'batch'))
 
     print(f"Using 3D mesh with shape: expert={expert_dim}, model={model_dim}, batch={batch_dim}")
-    
+
     return mesh, n_devices
 
 def get_param_spec(param, path):
     """Get parameter sharding specification based on parameter path and shape."""
     path_str = str(path).lower()
-    
+
     # Handle 1D parameters (biases, scales, etc.)
     if param.ndim == 1:
         # For larger 1D parameters (>10k elements), shard across model dimension
@@ -339,7 +332,7 @@ def get_param_spec(param, path):
             return P(None, 'model', None)
         # For smaller 1D parameters, replicate across all dimensions
         return P(None)
-    
+
     # Handle expert-related parameters
     if 'experts' in path_str:
         if 'keys' in path_str or 'values' in path_str:
@@ -349,7 +342,7 @@ def get_param_spec(param, path):
                 return P('expert')
         elif 'jump' in path_str:
             return P('expert')
-    
+
     # Router parameters
     if 'router' in path_str:
         if 'gate' in path_str:
@@ -362,7 +355,7 @@ def get_param_spec(param, path):
                 return P(None)
         elif 'temperature' in path_str:
             return P(None)
-    
+
     # Output projection and embedding layers
     if 'output_proj' in path_str or 'lm_head' in path_str or 'out_proj' in path_str:
         if 'kernel' in path_str:
@@ -371,12 +364,12 @@ def get_param_spec(param, path):
             return P(None, 'model', None)
         elif 'bias' in path_str:
             return P(None)
-    
+
     if 'embedding' in path_str:
         if param.ndim == 2:
             return P('expert', 'model')
         return P(None, 'model', None)
-    
+
     # Attention layers
     if 'attention' in path_str:
         if 'q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str:
@@ -393,21 +386,21 @@ def get_param_spec(param, path):
                 return P(None, 'model', None)
             elif 'bias' in path_str:
                 return P(None)
-    
+
     # Layer normalization parameters
     if 'norm' in path_str or 'layernorm' in path_str or 'rmsnorm' in path_str:
         return P(None)
-    
+
     # Size-based fallbacks
     if param.size < 10000:
         return P(None)
-    
+
     # Default for remaining 2D+ parameters
     if param.ndim == 2:
         return P('expert', 'model')
     elif param.ndim >= 3:
         return P(None, 'model', None)
-    
+
     # Default fallback for any other parameters
     return P(None)
 
@@ -415,22 +408,22 @@ def validate_param_spec(param, spec):
     """Validate that the parameter sharding specification is compatible with the parameter shape."""
     if spec is None:
         return True
-    
+
     # Count non-None axes in the spec
     non_none_axes = sum(1 for axis in spec if axis is not None)
-    
+
     # Check if the number of non-None axes matches the parameter ndim
     if non_none_axes > param.ndim:
         return False
-    
+
     # For 1D parameters, ensure we don't have a 3D spec
     if param.ndim == 1 and len(spec) > 1:
         return False
-    
+
     # For 2D parameters, ensure we don't have a 3D spec
     if param.ndim == 2 and len(spec) > 2:
         return False
-    
+
     return True
 
 def get_param_spec_validated(param, path):
@@ -453,7 +446,7 @@ def get_param_spec_validated(param, path):
 def prefetch(iterator, size):
     """Creates a prefetch queue for the iterator."""
     queue = collections.deque()
-    
+
     def enqueue(n):
         for data in itertools.islice(iterator, n):
             queue.append(data)
@@ -467,15 +460,15 @@ def create_prefetch_batches(dataset, indices, samples_per_step, mesh, start_idx=
     """Creates an iterator that prefetches batches while training."""
     batch_indices = [
         idx for idx in [
-            indices[i:i + samples_per_step] 
+            indices[i:i + samples_per_step]
             for i in range(0, len(indices), samples_per_step)
         ]
         if len(idx) == samples_per_step
     ]
-    
+
     # Start from the specified batch index
     batch_indices = batch_indices[start_idx:]
-    
+
     return prefetch(
         map(lambda idx: create_batch(mesh, dataset[idx]), batch_indices),
         num_prefetch
@@ -584,7 +577,7 @@ def main():
 
         for epoch in range(start_epoch, NUM_EPOCHS):
             shuffled_indices = np.random.RandomState(seed=epoch).permutation(len(tokenized_dataset))
-            
+
             print(f"Syncing epoch {epoch} for process {jax.process_index()}")
             sync_global_devices(f'epoch_{epoch}')
 
@@ -602,7 +595,7 @@ def main():
                 position=0,
                 initial=start_batch_idx if epoch == start_epoch else 0
             )
-            
+
             for batch_idx in range(start_batch_idx if epoch == start_epoch else 0, steps_per_epoch):
                 try:
                     batch = next(batch_iterator)
@@ -633,7 +626,7 @@ def main():
                             print(f"Checkpoint saved at {os.path.join(CHECKPOINT_DIR, f'checkpoint_{step}')}")
 
                     step += 1
-                    
+
                 except StopIteration:
                     print(f"Reached end of dataset in epoch {epoch}")
                     break
