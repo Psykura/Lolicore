@@ -16,3 +16,4 @@ wheels/
 checkpoints
 tokenized_dataset
 .DS_Store
+wandb

@@ -1,19 +1,13 @@
 import os
-
-import jax.tools
-import jax.tools.build_utils
-import jax.tools.colab_tpu
 if os.path.exists('transformer.py'):
     from transformer import Transformer
-
 import jax
 import jax.numpy as jnp
 import optax
 from datasets import load_dataset, load_from_disk
 from transformers import AutoTokenizer
 from flax.training import train_state
-from typing import Dict, Tuple
-from functools import partial
+from typing import Dict
 from tqdm import tqdm
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 import wandb
@@ -22,16 +16,15 @@ import numpy as np
 import collections
 import itertools
 import orbax.checkpoint as ocp
-from flax.training import orbax_utils
 # This script trains a Transformer model with MoE (Mixture of Experts) architecture
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
 
 # Constants
 CONTEXT_LENGTH = 256
-BATCH_SIZE = 4
+BATCH_SIZE = 32
 NUM_EPOCHS = 5
-LEARNING_RATE = 1e-5
-WARMUP_STEPS = 100
+LEARNING_RATE = 1e-4
+WARMUP_STEPS = 1000
 GRADIENT_CLIP_NORM = 0.5
 BATCH_MESH_SIZE = 4
 DTYPE = jnp.bfloat16  # Set default dtype to bfloat16
@@ -49,12 +42,12 @@ MODEL_CONFIG = {
     'hidden_size': 4096,
     'max_seq_length': CONTEXT_LENGTH,
     'vocab_size': vocab_size,  # GPT-2 vocab size
-    'num_experts': 16,
+    'num_experts': 8,
     'num_shared_experts': 1,
     'use_gradient_checkpointing': True,
-    'attention_latent_dim': 64,
-    'num_constant_experts': 4,
-    'num_noise_experts': 1,
+    'attention_latent_dim': 32,
+    'num_constant_experts': 2,
+    'num_noise_experts': 0,
 }
 
 # Dataset configuration
@@ -470,7 +463,7 @@ def prefetch(iterator, size):
         yield queue.popleft()
         enqueue(1)
 
-def create_prefetch_batches(dataset, indices, samples_per_step, mesh, num_prefetch=4):
+def create_prefetch_batches(dataset, indices, samples_per_step, mesh, start_idx=0, num_prefetch=4):
     """Creates an iterator that prefetches batches while training."""
     batch_indices = [
         idx for idx in [
@@ -479,6 +472,9 @@ def create_prefetch_batches(dataset, indices, samples_per_step, mesh, num_prefet
         ]
         if len(idx) == samples_per_step
     ]
+    
+    # Start from the specified batch index
+    batch_indices = batch_indices[start_idx:]
     
     return prefetch(
         map(lambda idx: create_batch(mesh, dataset[idx]), batch_indices),
@@ -547,23 +543,25 @@ def main():
 
         step = 0
         state = create_train_state(
-            init_rng,
-            mesh=mesh,
-            **MODEL_CONFIG,
-            learning_rate_fn=learning_rate_fn
+          init_rng,
+          mesh=mesh,
+          **MODEL_CONFIG,
+          learning_rate_fn=learning_rate_fn
         )
 
         print(f"Syncing training state for process {jax.process_index()}")
         sync_global_devices('training_state_created')
 
         # Restore from checkpoint
-        restore_args = orbax_utils.restore_args_from_target(state)
+        just_loaded = False
         latest_step = async_checkpoint_manager.latest_step()
         if latest_step is not None:
             print(f"Restoring from checkpoint at step {latest_step}")
             step = latest_step
-            state = async_checkpoint_manager.restore(latest_step, items=state, restore_kwargs={'restore_args': restore_args})
+            loaded_state = async_checkpoint_manager.restore(latest_step)
+            state = state.replace(params=loaded_state['state']['params'])
             async_checkpoint_manager.wait_until_finished()
+            just_loaded = True
         else:
             print("No checkpoint found, training from scratch")
 
@@ -595,17 +593,15 @@ def main():
                 shuffled_indices,
                 samples_per_step,
                 mesh,
+                start_idx=start_batch_idx if epoch == start_epoch else 0
             )
 
             progress_bar = tqdm(
                 range(steps_per_epoch),
                 desc=f"Epoch {epoch+1}/{NUM_EPOCHS}",
-                position=0
+                position=0,
+                initial=start_batch_idx if epoch == start_epoch else 0
             )
-
-            if epoch == start_epoch and start_batch_idx > 0:
-                for _ in range(start_batch_idx):
-                    next(batch_iterator)
             
             for batch_idx in range(start_batch_idx if epoch == start_epoch else 0, steps_per_epoch):
                 try:
@@ -628,10 +624,13 @@ def main():
                             })
 
                     if (batch_idx % 5000 == 0 or step % 5000 == 0) and step != 0:
-                        print(f"\nSaving checkpoint at step {step}...")
-                        async_checkpoint_manager.save(step, state)
-                        async_checkpoint_manager.wait_until_finished()
-                        print(f"Checkpoint saved at {os.path.join(CHECKPOINT_DIR, f'checkpoint_{step}')}")
+                        if just_loaded:
+                            just_loaded = False
+                        else:
+                            print(f"\nSaving checkpoint at step {step}...")
+                            async_checkpoint_manager.save(step, {"state": state})
+                            async_checkpoint_manager.wait_until_finished()
+                            print(f"Checkpoint saved at {os.path.join(CHECKPOINT_DIR, f'checkpoint_{step}')}")
 
                     step += 1
                     
