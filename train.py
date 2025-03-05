@@ -16,30 +16,33 @@ import numpy as np
 import collections
 import itertools
 import orbax.checkpoint as ocp
+import random
+from functools import partial
+
 # This script trains a Transformer model with MoE (Mixture of Experts) architecture
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
 
 # Constants
-CONTEXT_LENGTH = 256
-BATCH_SIZE = 8
-NUM_EPOCHS = 5
+CONTEXT_LENGTH = 512
+BATCH_SIZE = 128
+NUM_EPOCHS = 10
 LEARNING_RATE = 1e-4
-WARMUP_STEPS = 100
-GRADIENT_CLIP_NORM = 0.5
-BATCH_MESH_SIZE = 2
+WARMUP_STEPS = 500
+GRADIENT_CLIP_NORM = 1.0
 DTYPE = jnp.bfloat16  # Set default dtype to bfloat16
-PARALLEL_PROCESSING = 16
-TOKENIZED_DATASET_PATH = './tokenized_dataset'
+PARALLEL_PROCESSING = 8
+TOKENIZED_DATASET_PATH = '/mnt/data/tokenized_dataset'
+EVAL_STEPS = 1000  # How often to evaluate on test set
 
 vocab_size = 50257
 vocab_size = ((vocab_size + 127) // 128) * 128
 
 # Model hyperparameters
 MODEL_CONFIG = {
-    'num_blocks': 6,
+    'num_blocks': 12,
     'num_heads': 8,
-    'd_model': 512,
-    'hidden_size': 2048,
+    'd_model': 768,
+    'hidden_size': 8192,
     'max_seq_length': CONTEXT_LENGTH,
     'vocab_size': vocab_size,  # GPT-2 vocab size
     'num_experts': 16 + 2 + 2,
@@ -47,14 +50,14 @@ MODEL_CONFIG = {
     'use_gradient_checkpointing': True,
     'attention_latent_dim': 64,
     'num_constant_experts': 2,
-    'num_noise_experts': 2,
+    'num_noise_experts': 0,
     'top_k': 2,
 }
 
 # Dataset configuration
 DATASET_CONFIG = {
-    'path': "wikitext", #'HuggingFaceFW/fineweb',
-    'name': "wikitext-103-v1", #'sample-10BT',
+    'path': 'HuggingFaceFW/fineweb',
+    'name': 'sample-10BT',
     'split': 'train',
 }
 
@@ -74,7 +77,7 @@ def create_learning_rate_schedule(
     cosine_fn = optax.cosine_decay_schedule(
         init_value=base_learning_rate,
         decay_steps=max(num_train_steps - warmup_steps, 1),
-        alpha=0.1
+        alpha=0.2
     )
 
     return optax.join_schedules(
@@ -134,9 +137,9 @@ def create_train_state(
         optax.clip_by_global_norm(GRADIENT_CLIP_NORM),
         optax.adamw(
             learning_rate=learning_rate_fn,
-            weight_decay=0.01,
+            weight_decay=0.005,
             b1=0.9,
-            b2=0.999,
+            b2=0.95,
             eps=1e-8,
         )
     )
@@ -176,12 +179,89 @@ def check_param_spec_consistency(path, param, sharding):
         print(f"  Spec: {spec} (effective ndim={spec_ndim})")
     return sharding
 
+def calculate_metrics(logits, labels, mask):
+    """Calculate loss, accuracy, and perplexity metrics."""
+    shift_logits = logits[..., :-1, :].astype(jnp.float32)
+    shift_labels = labels[..., 1:]
+    loss_mask = mask[..., :-1]
+    
+    # Calculate cross entropy loss
+    loss = optax.softmax_cross_entropy_with_integer_labels(
+        shift_logits,
+        shift_labels,
+    )
+    loss = (loss * loss_mask).sum() / (loss_mask.sum() + 1e-9)
+    
+    # Calculate accuracy
+    predictions = jnp.argmax(shift_logits, axis=-1)
+    correct_predictions = (predictions == shift_labels) * loss_mask
+    accuracy = correct_predictions.sum() / (loss_mask.sum() + 1e-9)
+    
+    # Calculate perplexity
+    perplexity = jnp.exp(loss)
+    
+    return {
+        'loss': loss,
+        'accuracy': accuracy,
+        'perplexity': perplexity
+    }
+
+@jax.jit
+def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], step: int, rngs: jax.random.PRNGKey):
+    """Perform a single training step."""
+    noise_rng = jax.random.fold_in(rngs, step)
+
+    def loss_fn(params):
+        logits, router_loss = state.apply_fn(
+            {'params': params},
+            batch['input_ids'],
+            batch['attention_mask'],
+            rngs={'noise': noise_rng}
+        )
+        
+        metrics = calculate_metrics(logits, batch['labels'], batch['attention_mask'])
+        total_loss = metrics['loss'] + router_loss
+        
+        return total_loss, (metrics, router_loss)
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (total_loss, (metrics, router_loss)), grads = grad_fn(state.params)
+    new_state = state.apply_gradients(grads=grads)
+
+    metrics['router_loss'] = router_loss
+    metrics['total_loss'] = total_loss
+    
+    return new_state, metrics
+
+@jax.jit
+def test_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray]):
+    """Perform a single test step."""
+    logits, router_loss = state.apply_fn(
+        {'params': state.params},
+        batch['input_ids'],
+        batch['attention_mask'],
+        rngs={'noise': jax.random.PRNGKey(0)}  # Fixed noise for evaluation
+    )
+    
+    metrics = calculate_metrics(logits, batch['labels'], batch['attention_mask'])
+    metrics['router_loss'] = router_loss
+    metrics['total_loss'] = metrics['loss'] + router_loss
+    
+    return metrics
+
 def prepare_dataset(tokenizer):
-    """Prepare dataset with tokenization and chunking."""
+    """Prepare dataset with tokenization and chunking, and create a test set."""
     if os.path.exists(TOKENIZED_DATASET_PATH):
         tokenized_dataset = load_from_disk(TOKENIZED_DATASET_PATH)
         print(f"Loaded tokenized dataset from disk with {len(tokenized_dataset)} examples")
-        return tokenized_dataset, len(tokenized_dataset)
+        
+        # Create test set
+        test_indices = random.Random(42).sample(range(len(tokenized_dataset)), BATCH_SIZE)
+        test_dataset = tokenized_dataset.select(test_indices)
+        train_indices = [i for i in range(len(tokenized_dataset)) if i not in test_indices]
+        train_dataset = tokenized_dataset.select(train_indices)
+        
+        return train_dataset, test_dataset, len(train_dataset)
 
     dataset = load_dataset(**DATASET_CONFIG, num_proc=PARALLEL_PROCESSING)
     print(f"Raw dataset size: {len(dataset)}")
@@ -227,7 +307,14 @@ def prepare_dataset(tokenizer):
 
     print(f"Processed dataset size: {len(tokenized_dataset)}")
     tokenized_dataset.save_to_disk(TOKENIZED_DATASET_PATH)
-    return tokenized_dataset, len(tokenized_dataset)
+    
+    # Create test set
+    test_indices = random.Random(42).sample(range(len(tokenized_dataset)), BATCH_SIZE)
+    test_dataset = tokenized_dataset.select(test_indices)
+    train_indices = [i for i in range(len(tokenized_dataset)) if i not in test_indices]
+    train_dataset = tokenized_dataset.select(train_indices)
+    
+    return train_dataset, test_dataset, len(train_dataset)
 
 def create_batch(mesh, inputs):
     """Create a sharded batch from dataset examples."""
@@ -273,43 +360,6 @@ def get_sharding_spec(ndim: int) -> P:
     else:
         # Default fallback
         return P(None)
-
-@jax.jit
-def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], step: int, rngs: jax.random.PRNGKey):
-    """Perform a single training step."""
-    noise_rng = jax.random.fold_in(rngs, step)
-
-    def loss_fn(params):
-        logits, router_loss = state.apply_fn(
-            {'params': params},
-            batch['input_ids'],
-            batch['attention_mask'],
-            rngs={'noise': noise_rng}
-        )
-
-        loss_mask = batch['attention_mask'][..., :-1]
-        shift_logits = logits[..., :-1, :].astype(jnp.float32)
-        shift_labels = batch['labels'][..., 1:]
-
-        main_loss = optax.softmax_cross_entropy_with_integer_labels(
-            shift_logits,
-            shift_labels,
-        )
-
-        main_loss = (main_loss * loss_mask).sum() / (loss_mask.sum() + 1e-9)
-        total_loss = main_loss + router_loss
-
-        return total_loss, (main_loss, router_loss)
-
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (total_loss, aux), grads = grad_fn(state.params)
-    new_state = state.apply_gradients(grads=grads)
-
-    return new_state, {
-        'loss': total_loss,
-        'main_loss': aux[0],
-        'router_loss': aux[1]
-    }
 
 def create_mesh():
     """Create an optimized device mesh for training MoE models."""
@@ -506,6 +556,47 @@ def get_param_spec_validated(param, path):
             return P(None)
     return spec
 
+def save_cpu_only_checkpoint(state, async_checkpointer: ocp.AsyncCheckpointer, checkpoint_dir, name="best_model"):
+    """
+    Saves a CPU-only version of the model parameters as a checkpoint.
+    
+    Args:
+        state: The current train state containing model parameters
+        async_checkpoint_manager: The checkpoint manager for saving
+        checkpoint_dir: Directory to save the checkpoint
+        name: Name for the checkpoint (default: "best_model")
+        optimize_for_inference: If True, reinitialize model with training=False
+    
+    Returns:
+        bool: True if a new checkpoint was saved, False otherwise
+    """
+    # Static variable to track best loss across function calls
+    
+    # Get a CPU device
+    cpu_device = jax.devices("cpu")[0]
+    
+    # First, get the parameters off their current devices (potentially sharded)
+    # Then transfer to CPU
+    with jax.default_device(cpu_device):
+        # Get model config without training flag        
+        # Properly copy parameters from devices to CPU
+        # First get from devices, then put to CPU
+        params_copy = jax.device_put(
+            jax.device_get(state.params),
+            cpu_device
+        )
+        
+        checkpoint_name = name
+        # Save only the parameters
+        checkpoint_data = {"params": params_copy}
+        
+        # Save the parameters-only checkpoint 
+        checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
+        async_checkpointer.save(checkpoint_path, checkpoint_data, force=True)
+    
+    print(f"\nParameters checkpoint saved at {os.path.join(checkpoint_dir, checkpoint_name)}")
+    return True
+
 def prefetch(iterator, size):
     """Creates a prefetch queue for the iterator."""
     queue = collections.deque()
@@ -537,9 +628,20 @@ def create_prefetch_batches(dataset, indices, samples_per_step, mesh, start_idx=
         num_prefetch
     )
 
+def evaluate_model(state, test_dataset, mesh):
+    """Evaluate the model on the test set."""
+    test_batch = create_batch(mesh, {
+        'input_ids': test_dataset['input_ids'],
+        'attention_mask': test_dataset['attention_mask'],
+        'labels': test_dataset['labels']
+    })
+    
+    metrics = test_step(state, test_batch)
+    return {k: float(v) for k, v in metrics.items()}
+
 def main():
     tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True)
-    tokenized_dataset, dataset_size = prepare_dataset(tokenizer)
+    train_dataset, test_dataset, dataset_size = prepare_dataset(tokenizer)
 
     try:
         from jax_smi import initialise_tracking
@@ -562,6 +664,7 @@ def main():
                 "warmup_steps": WARMUP_STEPS,
                 "gradient_clip_norm": GRADIENT_CLIP_NORM,
                 "dtype": str(DTYPE),
+                "model_config": MODEL_CONFIG,
             }
         )
 
@@ -576,14 +679,14 @@ def main():
 
     # Initialize async checkpoint manager
     async_checkpointer = ocp.AsyncCheckpointer(ocp.PyTreeCheckpointHandler(), timeout_secs=50)
-    async_checkpoint_manager = ocp.CheckpointManager(CHECKPOINT_DIR, async_checkpointer, options=ocp.CheckpointManagerOptions(enable_async_checkpointing=True, max_to_keep=2))
+    async_checkpoint_manager = ocp.CheckpointManager(CHECKPOINT_DIR, async_checkpointer, options=ocp.CheckpointManagerOptions(max_to_keep=2))
 
-    samples_per_step = BATCH_SIZE * BATCH_MESH_SIZE
-    steps_per_epoch = len(tokenized_dataset) // samples_per_step
+    samples_per_step = BATCH_SIZE
+    steps_per_epoch = len(train_dataset) // samples_per_step
     total_steps = steps_per_epoch * NUM_EPOCHS
 
     print(f"Original dataset size: {dataset_size}")
-    print(f"Tokenized dataset size: {len(tokenized_dataset)}")
+    print(f"Tokenized dataset size: {len(train_dataset)}")
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Total steps: {total_steps}")
 
@@ -638,14 +741,23 @@ def main():
 
         print(f"Starting training from step {step} (epoch {start_epoch}, batch {start_batch_idx})")
 
+        # Track best metrics
+        best_metrics = {
+            'train_loss': float('inf'),
+            'test_loss': float('inf'),
+            'test_perplexity': float('inf')
+        }
+        plateau_count = 0
+        early_stop_patience = 3
+
         for epoch in range(start_epoch, NUM_EPOCHS):
-            shuffled_indices = np.random.RandomState(seed=epoch).permutation(len(tokenized_dataset))
+            shuffled_indices = np.random.RandomState(seed=epoch).permutation(len(train_dataset))
 
             print(f"Syncing epoch {epoch} for process {jax.process_index()}")
             sync_global_devices(f'epoch_{epoch}')
 
             batch_iterator = create_prefetch_batches(
-                tokenized_dataset,
+                train_dataset,
                 shuffled_indices,
                 samples_per_step,
                 mesh,
@@ -672,27 +784,91 @@ def main():
                         })
 
                         if jax.process_index() == 0:
+                            # Log learning rate and training metrics
+                            current_lr = float(learning_rate_fn(step))
                             wandb.log({
                                 f"train/{k}": v for k, v in metrics.items()
                             } | {
                                 'train/step': step,
-                                'train/epoch': epoch + (batch_idx / steps_per_epoch)
+                                'train/epoch': epoch + (batch_idx / steps_per_epoch),
+                                'train/learning_rate': current_lr
                             })
 
-                    if (batch_idx % 5000 == 0 or step % 5000 == 0) and step != 0:
+                    # Evaluate and save checkpoint
+                    if step % EVAL_STEPS == 0 and step != 0:
                         if just_loaded:
                             just_loaded = False
                         else:
-                            print(f"\nSaving checkpoint at step {step}...")
+                            print(f"\nStep {step}: Evaluating model...")
+                            test_metrics = evaluate_model(state, test_dataset, mesh)
+                            
+                            if jax.process_index() == 0:
+                                wandb.log({
+                                    'test/loss': test_metrics['loss'],
+                                    'test/perplexity': test_metrics['perplexity'],
+                                    'test/step': step,
+                                    'test/epoch': epoch + (batch_idx / steps_per_epoch)
+                                })
+                                
+                                print(f"Test Loss: {test_metrics['loss']:.4f}, Perplexity: {test_metrics['perplexity']:.4f}")
+                            
+                            # Save checkpoint and best model if improved
+                            print(f"\nSaving checkpoint...")
                             async_checkpoint_manager.save(step, {"state": state})
-                            async_checkpoint_manager.wait_until_finished()
-                            print(f"Checkpoint saved at {os.path.join(CHECKPOINT_DIR, f'checkpoint_{step}')}")
+                            
+                            if test_metrics['perplexity'] < best_metrics['test_perplexity']:
+                                best_metrics['test_perplexity'] = test_metrics['perplexity']
+                                best_metrics['test_loss'] = test_metrics['loss']
+                                save_cpu_only_checkpoint(
+                                    state, 
+                                    async_checkpointer, 
+                                    CHECKPOINT_DIR,
+                                    name="best_model"
+                                )
+                                print(f"New best perplexity: {test_metrics['perplexity']:.4f}")
 
                     step += 1
 
                 except StopIteration:
                     print(f"Reached end of dataset in epoch {epoch}")
                     break
+            
+            # Evaluate on test set at end of epoch
+            test_metrics = evaluate_model(state, test_dataset, mesh)
+            
+            print(f"\nEpoch {epoch+1} Summary:")
+            print(f"Test Loss: {test_metrics['loss']:.4f}, Perplexity: {test_metrics['perplexity']:.4f}")
+            
+            # Check for improvement
+            if test_metrics['perplexity'] < best_metrics['test_perplexity']:
+                improvement = best_metrics['test_perplexity'] - test_metrics['perplexity']
+                best_metrics['test_perplexity'] = test_metrics['perplexity']
+                best_metrics['test_loss'] = test_metrics['loss']
+                plateau_count = 0
+                print(f"Test perplexity improved by {improvement:.4f}. New best: {test_metrics['perplexity']:.4f}")
+                
+                # Save best model
+                save_cpu_only_checkpoint(
+                    state,
+                    async_checkpointer,
+                    CHECKPOINT_DIR,
+                    name="best_model"
+                )
+            else:
+                plateau_count += 1
+                print(f"No improvement for {plateau_count} epochs. Best test perplexity: {best_metrics['test_perplexity']:.4f}")
+                
+                if plateau_count >= early_stop_patience:
+                    print(f"Early stopping after {early_stop_patience} epochs without improvement")
+                    break
+            
+            if jax.process_index() == 0:
+                wandb.log({
+                    'test/epoch_loss': test_metrics['loss'],
+                    'test/epoch_perplexity': test_metrics['perplexity'],
+                    'test/epoch_accuracy': test_metrics['accuracy'],
+                    'train/epoch': epoch + 1
+                })
 
         if jax.process_index() == 0:
             wandb.finish()

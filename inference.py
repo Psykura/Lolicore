@@ -24,8 +24,19 @@ class InferenceState(NamedTuple):
 def create_inference_state(
     checkpoint_dir: str,
     step: Optional[int] = None,
+    use_best_model: bool = True,
 ) -> InferenceState:
-    """Creates inference state and loads model weights from checkpoint."""
+    """Creates inference state and loads model weights from checkpoint.
+    
+    Args:
+        checkpoint_dir: Directory containing checkpoints
+        step: Specific step to load, or None to load latest
+        use_best_model: If True and step is None, first try to load 'best_model_inference'
+                        checkpoint before falling back to latest
+    
+    Returns:
+        InferenceState with loaded parameters and model
+    """
     # Ensure we're using CPU
     cpu_device = jax.devices("cpu")[0]
     with jax.default_device(cpu_device):
@@ -51,18 +62,73 @@ def create_inference_state(
             options=ocp.CheckpointManagerOptions(enable_async_checkpointing=True)
         )
 
-        if step is None:
-            step = async_checkpoint_manager.latest_step()
+        # Try to load best model if requested
+        loaded_step = None
+        loaded_params = None
+        if step is None and use_best_model:
+            try:
+                # Try to load the CPU-optimized best model
+                print("Attempting to load best_model_inference checkpoint...")
+                loaded_state = async_checkpoint_manager.restore('best_model_inference')
+                loaded_step = 'best_model_inference'
+                print("Loaded best_model_inference checkpoint successfully")
+            except Exception as e:
+                print(f"Could not load best_model_inference: {e}")
+                try:
+                    # Try to load the regular best model
+                    print("Attempting to load best_model checkpoint...")
+                    loaded_state = async_checkpoint_manager.restore('best_model')
+                    loaded_step = 'best_model'
+                    print("Loaded best_model checkpoint successfully")
+                except Exception as e:
+                    print(f"Could not load best_model: {e}")
+                    # Fall back to latest checkpoint
+                    loaded_step = async_checkpoint_manager.latest_step()
+                    if loaded_step is None:
+                        raise ValueError("No checkpoints found in directory")
+                    print(f"Falling back to latest checkpoint at step {loaded_step}")
+                    loaded_state = async_checkpoint_manager.restore(loaded_step)
+                    
+                    # Check if it's a parameter-only checkpoint or full state checkpoint
+                    if 'params' in loaded_state:
+                        # Parameter-only checkpoint
+                        loaded_params = loaded_state['params']
+                        print(f"Loaded step {loaded_step} parameters checkpoint successfully")
+                    elif 'state' in loaded_state and 'params' in loaded_state['state']:
+                        # Full state checkpoint
+                        loaded_params = loaded_state['state']['params']
+                        print(f"Loaded step {loaded_step} state checkpoint successfully")
+                    else:
+                        raise ValueError("Unrecognized checkpoint format")
+        else:
+            # Load specific step or latest
             if step is None:
-                raise ValueError("No checkpoints found in directory")
+                step = async_checkpoint_manager.latest_step()
+                if step is None:
+                    raise ValueError("No checkpoints found in directory")
+            
+            print(f"Loading checkpoint from step {step}")
+            loaded_state = async_checkpoint_manager.restore(step)
+            loaded_step = step
+            
+            # Check if it's a parameter-only checkpoint or full state checkpoint
+            if 'params' in loaded_state:
+                # Parameter-only checkpoint
+                loaded_params = loaded_state['params']
+                print(f"Loaded step {loaded_step} parameters checkpoint successfully")
+            elif 'state' in loaded_state and 'params' in loaded_state['state']:
+                # Full state checkpoint
+                loaded_params = loaded_state['state']['params']
+                print(f"Loaded step {loaded_step} state checkpoint successfully")
+            else:
+                raise ValueError("Unrecognized checkpoint format")
 
-        print(f"Loading checkpoint from step {step}")
-        loaded_state = async_checkpoint_manager.restore(step)['state']
         async_checkpoint_manager.wait_until_finished()
-        print("Checkpoint loaded successfully")
+        print(f"Checkpoint loaded successfully from {loaded_step}")
 
         # Update the initialized parameters with the loaded checkpoint
-        variables['params'].update(loaded_state['params'])
+        if loaded_params is not None:
+            variables['params'] = loaded_params
 
         # Create inference state with properly initialized parameters
         return InferenceState(
@@ -325,7 +391,12 @@ def main():
     # Initialize model state on CPU
     checkpoint_dir = "/root/checkpoints"
     print("Loading model from checkpoint...")
-    state, model = create_inference_state(checkpoint_dir)
+    
+    # First use the best model if available
+    state, model = create_inference_state(
+        checkpoint_dir,
+        use_best_model=True  # Will first try best_model_inference, then best_model, then latest
+    )
     
     # Example prompts
     prompts = [
@@ -339,23 +410,7 @@ def main():
         print(f"\nPrompt: {prompt}")
         print("-" * 50)
         
-        print("\nGenerating with sampling:")
-        generated_texts = generate_text(
-            prompt,
-            model,
-            state,
-            tokenizer,
-            max_length=10,
-            temperature=0.7,
-            top_k=50,
-            top_p=0.9,
-            num_return_sequences=1
-        )
-        
-        for i, text in enumerate(generated_texts, 1):
-            print(f"\nGeneration {i}:")
-            print(text)
-        
+        print("\nGenerating with greedy decoding:")
         greedy_text = greedy_generate_text(
             prompt,
             model,
