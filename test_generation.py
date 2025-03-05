@@ -1,36 +1,25 @@
+import os
 import jax
 import jax.numpy as jnp
 import numpy as np
 import time
 from transformers import AutoTokenizer
-from transformer import Transformer
+if os.path.exists('transformer.py'):
+    from transformer import Transformer
+    from train import MODEL_CONFIG
 #jax.config.update("jax_check_tracer_leaks", True)
 
-# Model configuration
-MODEL_CONFIG = {
-    'num_blocks': 6,
-    'num_heads': 8,
-    'd_model': 512,
-    'hidden_size': 2048,
-    'max_seq_length': 1024,
-    'attention_latent_dim': 64,
-    'vocab_size': 50257,  # GPT-2 vocab size
-    'num_experts': 8,
-    'num_shared_experts': 1,
-    'num_constant_experts': 0,
-    'num_noise_experts': 0,
-    'dtype': jnp.bfloat16,
-    'training': False,
-    'use_gradient_checkpointing': False,
-}
+MODEL_CONFIG['training'] = False
+MODEL_CONFIG['use_gradient_checkpointing'] = False
 
 @jax.jit
-def model_step(variables, input_ids, attention_mask):
+def model_step(variables, input_ids, attention_mask, rng):
     """Single forward pass of the model with JIT."""
     logits, _ = Transformer(**MODEL_CONFIG).apply(
         variables,
         input_ids,
-        attn_mask=attention_mask
+        attn_mask=attention_mask,
+        rngs={'noise': rng}
     )
     return logits
 
@@ -76,7 +65,8 @@ def test_autoregressive_generation():
     current_length = prompt_length
     for i in range(max_new_tokens):
         # Forward pass with masked sequence
-        logits = model_step(variables, padded_ids, attention_mask)
+        rng, rng_step = jax.random.split(rng)
+        logits = model_step(variables, padded_ids, attention_mask, rng=rng_step)
         
         # Get next token (only look at the current position)
         next_token = jnp.argmax(logits[:, current_length-1], axis=-1)

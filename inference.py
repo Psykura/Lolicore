@@ -1,36 +1,20 @@
 import os
 import jax
 import jax.numpy as jnp
-from flax.training import train_state
 import orbax.checkpoint as ocp
-from flax.training import orbax_utils
 from transformers import AutoTokenizer
 from typing import List, Optional, NamedTuple, Callable
 import numpy as np
+import time
 if os.path.exists("train.py"):
     from train import (
-        DTYPE, CONTEXT_LENGTH
+        DTYPE, CONTEXT_LENGTH, MODEL_CONFIG
     )
     from transformer import Transformer
 from functools import partial
 
-vocab_size = 50257
-vocab_size = ((vocab_size + 127) // 128) * 128
-
-MODEL_CONFIG = {
-    'num_blocks': 6,
-    'num_heads': 8,
-    'd_model': 512,
-    'hidden_size': 4096,
-    'max_seq_length': CONTEXT_LENGTH,
-    'vocab_size': vocab_size,  # GPT-2 vocab size
-    'num_experts': 16,
-    'num_shared_experts': 1,
-    'use_gradient_checkpointing': False,
-    'attention_latent_dim': 64,
-    'num_constant_experts': 4,
-    'num_noise_experts': 1,
-}
+MODEL_CONFIG['training'] = False
+MODEL_CONFIG['use_gradient_checkpointing'] = False
 
 class InferenceState(NamedTuple):
     """Simple state for inference without optimizer."""
@@ -46,7 +30,7 @@ def create_inference_state(
     cpu_device = jax.devices("cpu")[0]
     with jax.default_device(cpu_device):
         # First initialize the model to get the expected parameter structure
-        model = Transformer(dtype=DTYPE, training=False, **MODEL_CONFIG)
+        model = Transformer(**MODEL_CONFIG)
         
         # Create a dummy input for initialization
         dummy_input = jnp.ones((1, CONTEXT_LENGTH), dtype=jnp.int32)
@@ -117,24 +101,19 @@ def top_k_top_p_filtering(
     
     return logits
 
-#@partial(jax.jit, static_argnames=['apply_fn', 'temperature', 'top_k', 'top_p'])
 def generate_step(
     apply_fn: Callable,
     params: dict,
     input_ids: jnp.ndarray,
-    position_ids: jnp.ndarray,
-    kv_cache: jnp.ndarray,
     rng: jax.random.PRNGKey,
     temperature: float = 0.7,
     top_k: int = 50,
     top_p: float = 0.9,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Single step of text generation using KV cache."""
-    logits, new_kv_cache, _ = apply_fn(
+) -> jnp.ndarray:
+    """Single step of text generation."""
+    logits, _ = apply_fn(
         {'params': params},
         input_ids,
-        position_ids=position_ids,
-        kv_cache=kv_cache,
         rngs={'noise': rng}
     )
     
@@ -152,7 +131,7 @@ def generate_step(
     # Sample from the filtered distribution
     next_token = jax.random.categorical(rng, filtered_logits, axis=-1)
     
-    return next_token, new_kv_cache
+    return next_token
 
 def generate_text(
     prompt: str,
@@ -160,12 +139,11 @@ def generate_text(
     state: InferenceState,
     tokenizer: AutoTokenizer,
     max_length: int = 100,
-    temperature: float = 0.7,
+    temperature: float = 0.5,
     top_k: int = 50,
     top_p: float = 0.9,
     num_return_sequences: int = 1,
     seed: int = 42,
-    use_kv_cache: bool = True,
 ) -> List[str]:
     """Generate text from a prompt.
     
@@ -180,7 +158,6 @@ def generate_text(
         top_p: Nucleus sampling parameter
         num_return_sequences: Number of sequences to generate
         seed: Random seed
-        use_kv_cache: Whether to use KV cache for faster generation
     
     Returns:
         List of generated text sequences
@@ -200,73 +177,34 @@ def generate_text(
         
         # Prepare for batch generation
         input_ids = jnp.repeat(input_ids, num_return_sequences, axis=0)
-        batch_size = input_ids.shape[0]
-        
-        # Initialize KV cache if using it
-        kv_cache = None
-        if use_kv_cache:
-            kv_cache = model.init_kv_cache(batch_size, max_length + input_ids.shape[1])
-            # Process the initial sequence
-            position_ids = jnp.arange(input_ids.shape[1])
-            rng = jax.random.PRNGKey(seed)
-            
-            # Initial forward pass to fill the cache with prompt
-            _, kv_cache, _ = state.apply_fn(
-                {'params': state.params},
-                input_ids,
-                position_ids=position_ids,
-                kv_cache=kv_cache,
-                rngs={'noise': rng}
-            )
         
         # Track current sequence
         current_ids = input_ids
-        current_length = input_ids.shape[1]
         
         # Generate tokens one at a time
         for i in range(max_length):
             rng, step_rng = jax.random.split(jax.random.PRNGKey(seed + i))
             
-            if use_kv_cache:
-                # Get the last token and its position for KV cache
-                last_token = current_ids[:, -1:]
-                position_id = jnp.array([current_length + i])
-                
-                # Generate next token
-                next_token, kv_cache = generate_step(
-                    state.apply_fn,
-                    state.params,
-                    last_token,
-                    position_id,
-                    kv_cache,
-                    step_rng,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p
-                )
-            else:
-                # For non-KV cache, process the entire sequence each time
-                position_ids = jnp.arange(current_ids.shape[1])
-                logits, _, _ = state.apply_fn(
-                    {'params': state.params},
-                    current_ids,
-                    position_ids=position_ids,
-                    rngs={'noise': step_rng}
-                )
-                
-                # Get logits of the last token
-                next_token_logits = logits[:, -1, :]
-                
-                # Apply temperature and sampling methods
-                filtered_logits = top_k_top_p_filtering(
-                    next_token_logits,
-                    top_k=top_k,
-                    top_p=top_p,
-                    temperature=temperature
-                )
-                
-                # Sample from the filtered distribution
-                next_token = jax.random.categorical(step_rng, filtered_logits, axis=-1)
+            # Process the entire sequence each time
+            logits, _ = state.apply_fn(
+                {'params': state.params},
+                current_ids,
+                rngs={'noise': step_rng}
+            )
+            
+            # Get logits of the last token
+            next_token_logits = logits[:, -1, :]
+            
+            # Apply temperature and sampling methods
+            filtered_logits = top_k_top_p_filtering(
+                next_token_logits,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature
+            )
+            
+            # Sample from the filtered distribution
+            next_token = jax.random.categorical(step_rng, filtered_logits, axis=-1)
             
             # Append new token to sequence
             current_ids = jnp.concatenate([current_ids, next_token[:, None]], axis=1)
@@ -285,6 +223,101 @@ def generate_text(
         
         return generated_sequences
 
+def greedy_generate_text(
+    prompt: str,
+    model: Transformer,
+    state: InferenceState,
+    tokenizer: AutoTokenizer,
+    max_length: int = 20,
+    seed: int = 0,
+) -> str:
+    """Generate text using simple greedy decoding
+    
+    Args:
+        prompt: The input prompt to generate from
+        model: The transformer model
+        state: The inference state containing model parameters
+        tokenizer: The tokenizer
+        max_length: Maximum number of tokens to generate
+        seed: Random seed
+    
+    Returns:
+        Generated text sequence
+    """
+    # Ensure we're using CPU
+    cpu_device = jax.devices("cpu")[0]
+    with jax.default_device(cpu_device):
+        # Create prompt
+        input_tokens = tokenizer(prompt, return_tensors="np")
+        input_ids = jnp.array(input_tokens["input_ids"])
+        prompt_length = input_ids.shape[1]
+        batch_size = 1
+        
+        # Setup generation
+        print("Generating with greedy decoding...")
+        start_time = time.time()
+        
+        total_length = prompt_length + max_length
+        
+        # Pre-fill the sequence with padding tokens
+        padded_ids = jnp.pad(
+            input_ids,
+            ((0, 0), (0, max_length)),
+            mode='constant',
+            constant_values=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        )
+        
+        # Initialize attention mask (1 for prompt tokens, 0 for future tokens)
+        attention_mask = jnp.zeros((batch_size, total_length))
+        attention_mask = attention_mask.at[:, :prompt_length].set(1)
+        
+        @jax.jit
+        def model_step(variables, input_ids, attention_mask, rng):
+            """Single forward pass of the model with JIT."""
+            logits, _ = model.apply(
+                variables,
+                input_ids,
+                attn_mask=attention_mask,
+                rngs={'noise': rng}
+            )
+            return logits
+        
+        # Generate tokens
+        current_length = prompt_length
+        rng = jax.random.PRNGKey(seed)
+        
+        for i in range(max_length):
+            # Forward pass with masked sequence
+            rng, rng_step = jax.random.split(rng)
+            
+            logits = model_step(
+                {'params': state.params},
+                padded_ids,
+                attention_mask,
+                rng=rng_step
+            )
+            
+            # Get next token (only look at the current position)
+            next_token = jnp.argmax(logits[:, current_length-1], axis=-1)
+            
+            # Update sequence and mask
+            padded_ids = padded_ids.at[:, current_length].set(next_token)
+            attention_mask = attention_mask.at[:, current_length].set(1)
+            current_length += 1
+            
+            # Check for EOS
+            if next_token == tokenizer.eos_token_id:
+                break
+        
+        generation_time = time.time() - start_time
+        
+        # Get the actual generated sequence (without padding)
+        generated_ids = padded_ids[:, :current_length]
+        generated_text = tokenizer.decode(generated_ids[0])
+        
+        print(f"Generation time: {generation_time:.2f} seconds")
+        return generated_text
+
 def main():
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True)
@@ -301,12 +334,12 @@ def main():
         "In a galaxy far, far away"
     ]
     
-    # Generate text for each prompt with and without KV cache
+    # Generate text for each prompt with different generation methods
     for prompt in prompts:
         print(f"\nPrompt: {prompt}")
         print("-" * 50)
         
-        print("\nGenerating with KV cache:")
+        print("\nGenerating with sampling:")
         generated_texts = generate_text(
             prompt,
             model,
@@ -316,32 +349,23 @@ def main():
             temperature=0.7,
             top_k=50,
             top_p=0.9,
-            num_return_sequences=1,
-            use_kv_cache=True
+            num_return_sequences=1
         )
         
         for i, text in enumerate(generated_texts, 1):
             print(f"\nGeneration {i}:")
             print(text)
         
-        print("\nGenerating without KV cache:")
-        generated_texts = generate_text(
+        greedy_text = greedy_generate_text(
             prompt,
             model,
             state,
             tokenizer,
-            max_length=10,
-            temperature=0.7,
-            top_k=50,
-            top_p=0.9,
-            num_return_sequences=1,
-            use_kv_cache=False
+            max_length=10
         )
-        
-        for i, text in enumerate(generated_texts, 1):
-            print(f"\nGeneration {i}:")
-            print(text)
-            print("-" * 50)
+        print(f"\nGeneration:")
+        print(greedy_text)
+        print("-" * 50)
 
 if __name__ == "__main__":
     main() 

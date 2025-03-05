@@ -39,15 +39,15 @@ MODEL_CONFIG = {
     'num_blocks': 6,
     'num_heads': 8,
     'd_model': 512,
-    'hidden_size': 4096,
+    'hidden_size': 2048,
     'max_seq_length': CONTEXT_LENGTH,
     'vocab_size': vocab_size,  # GPT-2 vocab size
-    'num_experts': 16,
-    'num_shared_experts': 1,
+    'num_experts': 16 + 2 + 2,
+    'num_shared_experts': 2,
     'use_gradient_checkpointing': True,
     'attention_latent_dim': 64,
-    'num_constant_experts': 4,
-    'num_noise_experts': 1,
+    'num_constant_experts': 2,
+    'num_noise_experts': 2,
     'top_k': 2,
 }
 
@@ -262,12 +262,17 @@ def create_batch(mesh, inputs):
 def get_sharding_spec(ndim: int) -> P:
     """Helper function to determine sharding spec based on tensor rank."""
     if ndim == 3:
-        return P('expert', 'model', 'batch')
+        # For 3D tensors (batch, seq_len, features)
+        return P(None, None, 'batch')
     elif ndim == 2:
-        return P('expert', 'model')
+        # For 2D tensors (batch, seq_len)
+        return P(None, 'batch')
     elif ndim == 1:
+        # For 1D tensors
         return P(None)
-    return P(None)
+    else:
+        # Default fallback
+        return P(None)
 
 @jax.jit
 def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], step: int, rngs: jax.random.PRNGKey):
@@ -310,15 +315,70 @@ def create_mesh():
     """Create an optimized device mesh for training MoE models."""
     devices = jax.devices()
     n_devices = len(devices)
-
-    expert_dim = 4
-    model_dim = 2
-    batch_dim = n_devices // (expert_dim * model_dim)
+    
+    print(f"Found {n_devices} devices: {devices}")
+    
+    if n_devices == 0:
+        raise ValueError("No JAX devices found. Please check your JAX installation.")
+    
+    # Calculate optimal dimensions for device mesh
+    # For MoE models, we want to maximize expert parallelism first
+    # Then model parallelism, and finally batch parallelism
+    
+    # Determine optimal expert dimension based on model config
+    num_experts = MODEL_CONFIG['num_experts']
+    num_constant_experts = MODEL_CONFIG['num_constant_experts']
+    
+    # We need to ensure the expert dimension evenly divides both num_experts and num_constant_experts
+    # So we need to find the largest divisor of n_devices that is <= min(num_experts, num_constant_experts)
+    min_expert_dim = min(num_experts, num_constant_experts)
+    
+    # Try to find factors of n_devices that work well for expert sharding
+    possible_expert_dims = []
+    for i in range(1, min(min_expert_dim + 1, n_devices + 1)):
+        if n_devices % i == 0 and i <= min_expert_dim:
+            possible_expert_dims.append(i)
+    
+    # Choose the largest expert dimension that divides n_devices and is <= min_expert_dim
+    expert_dim = max(possible_expert_dims) if possible_expert_dims else 1
+    
+    # Now distribute remaining devices between model and batch dimensions
+    remaining_dims = n_devices // expert_dim
+    
+    # Ensure remaining_dims is at least 1
+    if remaining_dims < 1:
+        expert_dim = 1
+        remaining_dims = n_devices
+    
+    # Default to model_dim=1 for single device case
+    model_dim = 1
+    
+    # Prefer model parallelism over batch parallelism for better efficiency
+    # but ensure at least some batch parallelism
+    if remaining_dims > 1:
+        model_dim = 2
+        while remaining_dims % (model_dim * 2) == 0 and model_dim * 2 <= 8:  # Limit model dim to 8
+            model_dim *= 2
+    
+    batch_dim = max(1, remaining_dims // model_dim)
+    
+    # Verify our dimensions multiply to give the total number of devices
+    actual_devices = expert_dim * model_dim * batch_dim
+    if actual_devices != n_devices:
+        print(f"Warning: Calculated dimensions ({expert_dim}×{model_dim}×{batch_dim}={actual_devices}) " 
+              f"don't match total devices ({n_devices})")
+        # Fall back to a simpler configuration
+        if n_devices > 1:
+            expert_dim = 1
+            model_dim = 1
+            batch_dim = n_devices
+        else:
+            expert_dim = model_dim = batch_dim = 1
+    
+    print(f"Using 3D mesh with shape: expert={expert_dim}, model={model_dim}, batch={batch_dim}")
+    print(f"Total devices: {expert_dim * model_dim * batch_dim}")
     
     mesh = jax.make_mesh((expert_dim, model_dim, batch_dim), ('expert', 'model', 'batch'))
-
-    print(f"Using 3D mesh with shape: expert={expert_dim}, model={model_dim}, batch={batch_dim}")
-
     return mesh, n_devices
 
 def get_param_spec(param, path):
@@ -329,61 +389,57 @@ def get_param_spec(param, path):
     if param.ndim == 1:
         # For larger 1D parameters (>10k elements), shard across model dimension
         if param.size > 10000:
-            return P(None, 'model', None)
+            return P('model')
         # For smaller 1D parameters, replicate across all dimensions
+        return P(None)
+
+    # Handle constant experts specially to avoid expert dimension sharding issues
+    if 'constant_experts' in path_str:
+        if param.ndim == 2:  # Shape: (num_constant_experts, d_model)
+            return P(None, 'model')  # Don't shard on expert dimension
         return P(None)
 
     # Handle expert-related parameters
     if 'experts' in path_str:
-        if 'keys' in path_str or 'values' in path_str:
-            if 'kernel' in path_str:
+        # Special case for feedforward experts keys and values
+        if ('feedforward_experts' in path_str or 'shared_experts' in path_str) and param.ndim == 3:
+            if 'keys' in path_str:  # Shape: (num_experts, hidden_size, d_model)
                 return P('expert', 'model', None)
-            elif 'bias' in path_str:
-                return P('expert')
-        elif 'jump' in path_str:
+            elif 'values' in path_str:  # Shape: (num_experts, d_model, hidden_size)
+                return P('expert', 'model', None)
+        elif param.ndim == 3:  # Other 3D expert parameters
+            return P('expert', 'model', None)
+        elif param.ndim == 2:
+            return P('expert', 'model')
+        elif 'bias' in path_str:
             return P('expert')
 
     # Router parameters
     if 'router' in path_str:
         if 'gate' in path_str:
-            if 'kernel' in path_str:
+            if 'kernel' in path_str and param.ndim == 2:
                 # Router gate kernels are 2D (input_dim, num_experts)
-                if param.ndim == 2:
-                    return P('expert', 'model')
-                return P(None, 'model', None)
+                return P('expert', 'model')
             elif 'bias' in path_str:
                 return P(None)
         elif 'temperature' in path_str:
             return P(None)
 
     # Output projection and embedding layers
-    if 'output_proj' in path_str or 'lm_head' in path_str or 'out_proj' in path_str:
-        if 'kernel' in path_str:
-            if param.ndim == 2:
-                return P('expert', 'model')
-            return P(None, 'model', None)
-        elif 'bias' in path_str:
-            return P(None)
-
-    if 'embedding' in path_str:
-        if param.ndim == 2:
+    if 'lm_head' in path_str:
+        if 'kernel' in path_str and param.ndim == 2:
             return P('expert', 'model')
-        return P(None, 'model', None)
+        elif 'bias' in path_str:
+            return P('model')  # Shard large vocabulary biases along model dim
+    
+    if 'embedding' in path_str and param.ndim == 2:
+        return P('expert', 'model')
 
     # Attention layers
     if 'attention' in path_str:
-        if 'q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str:
-            if 'kernel' in path_str:
-                if param.ndim == 2:
-                    return P('expert', 'model')
-                return P(None, 'model', None)
-            elif 'bias' in path_str:
-                return P(None)
-        if 'out_proj' in path_str:
-            if 'kernel' in path_str:
-                if param.ndim == 2:
-                    return P('expert', 'model')
-                return P(None, 'model', None)
+        if ('q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str or 'out_proj' in path_str):
+            if 'kernel' in path_str and param.ndim == 2:
+                return P('expert', 'model')
             elif 'bias' in path_str:
                 return P(None)
 
@@ -399,7 +455,7 @@ def get_param_spec(param, path):
     if param.ndim == 2:
         return P('expert', 'model')
     elif param.ndim >= 3:
-        return P(None, 'model', None)
+        return P('expert', 'model', None)
 
     # Default fallback for any other parameters
     return P(None)
@@ -416,31 +472,38 @@ def validate_param_spec(param, spec):
     if non_none_axes > param.ndim:
         return False
 
-    # For 1D parameters, ensure we don't have a 3D spec
-    if param.ndim == 1 and len(spec) > 1:
-        return False
-
-    # For 2D parameters, ensure we don't have a 3D spec
-    if param.ndim == 2 and len(spec) > 2:
-        return False
-
     return True
 
 def get_param_spec_validated(param, path):
     """Get validated parameter sharding specification."""
     spec = get_param_spec(param, path)
+    
+    # Special case for lm_head bias which needs model dimension sharding
+    path_str = '/'.join(str(p) for p in path)
+    if 'lm_head' in path_str.lower() and 'bias' in path_str.lower() and param.ndim == 1:
+        return P('model')
+        
     if not validate_param_spec(param, spec):
-        path_str = '/'.join(str(p) for p in path)
         print(f"Warning: Invalid sharding spec for {path_str} with shape {param.shape}: {spec}")
-        # Fall back to a safe sharding spec
+        # Fall back to a safe sharding spec based on parameter dimensions
         if param.ndim == 0:
             return P(None)
         elif param.ndim == 1:
+            # For large 1D parameters (vocab biases), shard across model dim
+            if param.size > 10000:
+                return P('model')
             return P(None)
         elif param.ndim == 2:
+            # Most 2D parameters can be sharded across expert and model dimensions
             return P('expert', 'model')
+        elif param.ndim == 3:
+            # 3D parameters usually have expert dimension first, then features
+            if 'expert' in str(path).lower():
+                return P('expert', 'model', None)
+            return P(None, 'model', None)
         else:
-            return P(None, 'model', 'batch')
+            # Higher dimensional tensors (rarely encountered)
+            return P(None)
     return spec
 
 def prefetch(iterator, size):

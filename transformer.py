@@ -159,6 +159,22 @@ class FeedForward(nn.Module):
         output = jnp.einsum('bseh,edh->bsed', hidden, self.values)
         
         return output
+        
+    def process_by_indices(self, x, expert_indices, expert_weights):
+        # expert_indices shape: [batch, seq, top_k]
+        # Result shapes: [batch, seq, top_k, hidden_size, d_model] and [batch, seq, top_k, d_model, hidden_size]
+        selected_keys = self.keys[expert_indices]
+        selected_values = self.values[expert_indices]
+        
+        # [batch, seq, d_model] @ [batch, seq, top_k, hidden_size, d_model] -> [batch, seq, top_k, hidden_size]
+        hidden = jnp.einsum('bsd,bskhd->bskh', x, selected_keys)
+        hidden = self.activation(hidden)
+        
+        # [batch, seq, top_k, hidden_size] @ [batch, seq, top_k, d_model, hidden_size] * [batch, seq, top_k] 
+        # -> [batch, seq, d_model]
+        final_output = jnp.einsum('bskh,bskdh,bsk->bsd', hidden, selected_values, expert_weights)
+        
+        return final_output
 
 # ref to astralord/jax_parallel
 class Router(nn.Module):
@@ -170,7 +186,7 @@ class Router(nn.Module):
     dtype: jnp.dtype = jnp.bfloat16
     training: bool = False
     use_gradient_checkpointing: bool = False
-    top_k: int = 4
+    top_k: int = 2
 
     def setup(self):
         self.gate = nn.Dense(
@@ -202,6 +218,15 @@ class Router(nn.Module):
         # Square and mean across all tokens
         z_loss = jnp.mean(log_z ** 2)
         return z_loss
+    
+    def _eval_routing(self, x):
+        gating_logits = self.gate(x)        
+        gating_probs = jax.nn.softmax(gating_logits)
+
+        # expert_gate: [G, S, top_k] with the top_k probabilities.
+        # expert_index: [G, S, top_k] with the corresponding expert indices.
+        expert_gate, expert_index = jax.lax.top_k(gating_probs, self.top_k)
+        return expert_gate, expert_index
     
     def __call__(self, x, expert_capacity: int):
         # Compute gating probabilities for each token: shape [G, S, E]
@@ -295,7 +320,7 @@ class ExpertsFeedForward(nn.Module):
     expert_capacity_factor: float = 2.0
     min_expert_capacity: int = 8
     max_group_size: int = 4096
-    top_k: int = 4
+    top_k: int = 2
     dtype: jnp.dtype = jnp.bfloat16
     training: bool = False
     use_gradient_checkpointing: bool = False
@@ -478,9 +503,100 @@ class ExpertsFeedForward(nn.Module):
         output = self._degroup_outputs(output, batch_size, seq_len)
         
         return output, router_loss
+    
+    def _eval_routing(self, x):        
+        # Get shared expert output (same as in training)
+        shared_output = self._process_shared_experts(x)
+        
+        # Get top_k expert indices and weights from router
+        expert_gate, expert_index = self.router._eval_routing(x)
+        router_loss = 0.0  # No loss during evaluation
+        
+        output = shared_output
+        
+        # Process feedforward experts directly using indices
+        if self.num_ff_experts > 0:
+            # Filter indices and weights for feedforward experts only
+            ff_mask = expert_index < self.num_ff_experts
+            
+            # Normalize weights for feedforward experts - multiply by mask to zero out non-FF experts
+            ff_weights = expert_gate * ff_mask
+            ff_weights_sum = jnp.sum(ff_weights, axis=-1, keepdims=True)
+            # Add small epsilon to avoid division by zero
+            ff_weights = ff_weights / (ff_weights_sum + 1e-9)
+            
+            # Keep only feedforward expert indices, use zeros for masked positions
+            ff_indices = jnp.where(ff_mask, expert_index, 0)
+            
+            # Process using direct parameter indexing
+            ff_output = self.feedforward_experts.process_by_indices(
+                x, ff_indices, ff_weights
+            )
+            output = output + ff_output
+        
+        # Process constant experts if needed
+        if self.num_constant_experts > 0:
+            start_idx = self.num_ff_experts
+            end_idx = start_idx + self.num_constant_experts
+            
+            # Filter indices for constant experts
+            const_mask = (expert_index >= start_idx) & (expert_index < end_idx)
+            
+            # Normalize weights for constant experts - multiply by mask to zero out non-constant experts
+            const_weights = expert_gate * const_mask
+            const_weights_sum = jnp.sum(const_weights, axis=-1, keepdims=True)
+            # Add small epsilon to avoid division by zero
+            const_weights = const_weights / (const_weights_sum + 1e-9)
+            
+            # Adjust indices to be relative to the constant experts section
+            const_indices = jnp.where(const_mask, expert_index - start_idx, 0)
+            
+            # Get constant expert outputs and combine directly with one einsum
+            const_experts = self.constant_experts.jump  # Shape: [num_const_experts, d_model]
+            
+            # Use einsum to directly select and combine expert outputs
+            # We need to generate one-hot encoding of const_indices to select the right experts
+            const_one_hot = jax.nn.one_hot(const_indices, self.num_constant_experts)  # [batch, seq, top_k, num_const_experts]
+            
+            # Multiply one-hot by weights and mask, then use einsum to select experts
+            # [batch, seq, top_k, num_const_experts] * [batch, seq, top_k] -> [batch, seq, top_k, num_const_experts]
+            selection_weights = const_one_hot * const_weights[:, :, :, None] * const_mask[:, :, :, None]
+            
+            # Use einsum to apply selection weights to experts
+            # [batch, seq, top_k, num_const_experts] @ [num_const_experts, d_model] -> [batch, seq, d_model]
+            const_output = jnp.einsum('bske,ed->bsd', selection_weights, const_experts)
+            
+            output = output + const_output
+        
+        # Process noise experts if needed
+        if self.num_noise_experts > 0 and self.training:  # Only use noise in training mode
+            start_idx = self.num_ff_experts + self.num_constant_experts
+            end_idx = start_idx + self.num_noise_experts
+            
+            # Filter indices for noise experts
+            noise_mask = (expert_index >= start_idx) & (expert_index < end_idx)
+            
+            # Normalize weights for noise experts - multiply by mask to zero out non-noise experts
+            noise_weights = expert_gate * noise_mask
+            noise_weights_sum = jnp.sum(noise_weights, axis=-1, keepdims=True)
+            # Add small epsilon to avoid division by zero
+            noise_weights = noise_weights / (noise_weights_sum + 1e-9)
+            
+            # For evaluation, noise experts can be skipped or applied with reduced magnitude
+            # We'll apply a small fixed noise value instead of random noise
+            noise_scale = 0.001  # Very small scale for eval
+            noise_output = jnp.einsum('bsk->bs', noise_weights) * noise_scale
+            noise_output = noise_output[:, :, None]  # Add feature dimension
+            
+            output = output + noise_output
+        
+        return output, router_loss
 
     def __call__(self, x):
-        return self._train_routing(x)
+        if self.training or x.shape[0] * x.shape[1] > 18:
+            return self._train_routing(x)
+        else:
+            return self._eval_routing(x)
 
 class Block(nn.Module):
     """Transformer block with attention and MoE feed-forward layers."""
@@ -493,7 +609,7 @@ class Block(nn.Module):
     num_shared_experts: int = 1
     num_constant_experts: int = 0
     num_noise_experts: int = 0
-    top_k: int = 4
+    top_k: int = 2
     dtype: jnp.dtype = jnp.bfloat16
     use_gradient_checkpointing: bool = False
     training: bool = False
@@ -543,7 +659,7 @@ class Transformer(nn.Module):
     num_shared_experts: int = 1
     num_constant_experts: int = 0
     num_noise_experts: int = 0
-    top_k: int = 4
+    top_k: int = 2
     dtype: jnp.dtype = jnp.bfloat16
     use_gradient_checkpointing: bool = False
     training: bool = False
