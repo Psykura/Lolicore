@@ -85,34 +85,6 @@ def create_learning_rate_schedule(
         boundaries=[warmup_steps]
     )
 
-def debug_param_sharding(params, param_shardings):
-    """Print out parameter shapes and their sharding specifications for debugging."""
-    print("\nParameter Sharding Debug Information")
-    print(f"{'Parameter Path':<60} {'Shape':<20} {'Size (MB)':<12} {'Sharding':<15}")
-    print("-" * 107)
-
-    flat_params = jax.tree_util.tree_flatten_with_path(params)[0]
-    flat_shardings = jax.tree_util.tree_flatten_with_path(param_shardings)[0]
-
-    param_info = []
-    for (path, param), (_, sharding) in zip(flat_params, flat_shardings):
-        path_str = '.'.join(str(p) for p in path)
-        size_mb = param.size * param.dtype.itemsize / (1024 * 1024)
-        param_info.append((
-            path_str[:57] + '...' if len(path_str) > 60 else path_str,
-            str(param.shape),
-            size_mb,
-            str(sharding.spec)
-        ))
-
-    total_size_mb = 0
-    for path_str, shape_str, size_mb, sharding_str in sorted(param_info, key=lambda x: x[2], reverse=True):
-        print(f"{path_str:<60} {shape_str:<20} {size_mb:<12.2f} {sharding_str:<15}")
-        total_size_mb += size_mb
-
-    print("-" * 107)
-    print(f"Total parameter size: {total_size_mb:.2f} MB\n")
-
 def create_train_state(
     rng: jax.random.PRNGKey,
     mesh: Mesh,
@@ -123,15 +95,6 @@ def create_train_state(
     model = Transformer(dtype=DTYPE, training=True, **kwargs)
     rng, params_rng, dropout_rng, noise_rng = jax.random.split(rng, 4)
     rngs = {'params': params_rng, 'dropout': dropout_rng, 'noise': noise_rng}
-
-    print("Initializing model on CPU...")
-    cpu_device = jax.devices("cpu")[0]
-    cpu_dummy_input = jax.device_put(jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32), cpu_device)
-    cpu_dummy_mask = jax.device_put(jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32), cpu_device)
-
-    with jax.default_device(cpu_device):
-        cpu_variables = model.init(rngs, cpu_dummy_input, cpu_dummy_mask)
-    print("CPU initialization complete")
 
     optimizer = optax.chain(
         optax.clip_by_global_norm(GRADIENT_CLIP_NORM),
@@ -145,39 +108,102 @@ def create_train_state(
     )
 
     with mesh:
-        print("Transferring parameters to mesh...")
-        param_shardings = jax.tree.map_with_path(
-            lambda path, p: NamedSharding(mesh, get_param_spec_validated(p, path)),
-            cpu_variables['params']
-        )
-
-        if jax.process_index() == 0:
-            print("Parameters with inconsistent dimensions:")
-            jax.tree.map_with_path(
-                lambda path, p, s: check_param_spec_consistency(path, p, s),
-                cpu_variables['params'],
-                param_shardings
-            )
-            debug_param_sharding(cpu_variables['params'], param_shardings)
-
-        sharded_params = jax.device_put(cpu_variables['params'], param_shardings)
-        print("Parameter transfer complete")
-
-        return train_state.TrainState.create(
+        print("Initializing model directly on mesh...")
+        # Create dummy inputs with proper sharding
+        dummy_input = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
+        dummy_mask = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
+        
+        # Initialize model directly on the mesh
+        variables = model.init(rngs, dummy_input, dummy_mask)
+        
+        print("Creating optimizer state...")
+        opt_state = optimizer.init(variables['params'])
+        
+        state = train_state.TrainState.create(
             apply_fn=model.apply,
-            params=sharded_params,
-            tx=optimizer
+            params=variables['params'],
+            tx=optimizer,
+            opt_state=opt_state,
         )
+        
+        print("Train state created successfully")
+        
+        # Print total parameter count
+        param_count = sum(p.size for p in jax.tree.leaves(variables['params']))
+        print(f"Total parameters: {param_count:,}")
+        
+        return state
 
-def check_param_spec_consistency(path, param, sharding):
-    spec = sharding.spec
-    spec_ndim = sum(1 for axis in spec if axis is not None)
-    if spec_ndim != param.ndim:
-        path = '/'.join(str(p) for p in path)
-        print(f"Inconsistent parameter: {path}")
-        print(f"  Shape: {param.shape} (ndim={param.ndim})")
-        print(f"  Spec: {spec} (effective ndim={spec_ndim})")
-    return sharding
+def create_mesh():
+    """Create an optimized device mesh for training MoE models."""
+    devices = jax.devices()
+    n_devices = len(devices)
+    
+    print(f"Found {n_devices} devices: {devices}")
+    
+    if n_devices == 0:
+        raise ValueError("No JAX devices found. Please check your JAX installation.")
+    
+    # Calculate optimal dimensions for device mesh
+    # For MoE models, we want to maximize expert parallelism first
+    # Then model parallelism, and finally batch parallelism
+    
+    # Determine optimal expert dimension based on model config
+    num_experts = MODEL_CONFIG['num_experts']
+    num_constant_experts = MODEL_CONFIG['num_constant_experts']
+    
+    # We need to ensure the expert dimension evenly divides both num_experts and num_constant_experts
+    # So we need to find the largest divisor of n_devices that is <= min(num_experts, num_constant_experts)
+    min_expert_dim = min(num_experts, num_constant_experts)
+    
+    # Try to find factors of n_devices that work well for expert sharding
+    possible_expert_dims = []
+    for i in range(1, min(min_expert_dim + 1, n_devices + 1)):
+        if n_devices % i == 0 and i <= min_expert_dim:
+            possible_expert_dims.append(i)
+    
+    # Choose the largest expert dimension that divides n_devices and is <= min_expert_dim
+    expert_dim = max(possible_expert_dims) if possible_expert_dims else 1
+    
+    # Now distribute remaining devices between model and batch dimensions
+    remaining_dims = n_devices // expert_dim
+    
+    # Ensure remaining_dims is at least 1
+    if remaining_dims < 1:
+        expert_dim = 1
+        remaining_dims = n_devices
+    
+    # Default to model_dim=1 for single device case
+    model_dim = 1
+    
+    # Prefer model parallelism over batch parallelism for better efficiency
+    # but ensure at least some batch parallelism
+    if remaining_dims > 1:
+        model_dim = 2
+        while remaining_dims % (model_dim * 2) == 0 and model_dim * 2 <= 8:  # Limit model dim to 8
+            model_dim *= 2
+    
+    batch_dim = max(1, remaining_dims // model_dim)
+    
+    # Verify our dimensions multiply to give the total number of devices
+    actual_devices = expert_dim * model_dim * batch_dim
+    if actual_devices != n_devices:
+        print(f"Warning: Calculated dimensions ({expert_dim}×{model_dim}×{batch_dim}={actual_devices}) " 
+              f"don't match total devices ({n_devices})")
+        # Fall back to a simpler configuration
+        if n_devices > 1:
+            expert_dim = 1
+            model_dim = 1
+            batch_dim = n_devices
+        else:
+            expert_dim = model_dim = batch_dim = 1
+    
+    print(f"Using 3D mesh with shape: expert={expert_dim}, model={model_dim}, batch={batch_dim}")
+    print(f"Total devices: {expert_dim * model_dim * batch_dim}")
+    
+    # Create mesh with logical axes that match our model's partitioning
+    mesh = jax.make_mesh((expert_dim, model_dim, batch_dim), ('expert', 'model', 'data'))
+    return mesh, n_devices
 
 def calculate_metrics(logits, labels, mask):
     """Calculate loss, accuracy, and perplexity metrics."""
@@ -316,8 +342,8 @@ def prepare_dataset(tokenizer):
     
     return train_dataset, test_dataset, len(train_dataset)
 
-def create_batch(mesh, inputs):
-    """Create a sharded batch from dataset examples."""
+def create_batch(inputs):
+    """Create a batch from dataset examples."""
     examples = {}
     for k, v in inputs.items():
         if k == 'attention_mask':
@@ -329,22 +355,8 @@ def create_batch(mesh, inputs):
             examples[k] = jnp.array(masks)
         else:
             examples[k] = jnp.array(v)
-
-    if isinstance(examples, dict):
-        sharded_examples = {}
-        for key, value in examples.items():
-            if hasattr(value, 'ndim'):
-                ndim = value.ndim
-                spec = get_sharding_spec(ndim)
-                sharded_examples[key] = jax.device_put(value, NamedSharding(mesh, spec))
-            else:
-                sharded_examples[key] = value
-        return sharded_examples
-    else:
-        if hasattr(examples, 'ndim'):
-            spec = get_sharding_spec(examples.ndim)
-            return jax.device_put(examples, NamedSharding(mesh, spec))
-        return examples
+    
+    return examples
 
 def get_sharding_spec(ndim: int) -> P:
     """Helper function to determine sharding spec based on tensor rank."""
@@ -360,201 +372,6 @@ def get_sharding_spec(ndim: int) -> P:
     else:
         # Default fallback
         return P(None)
-
-def create_mesh():
-    """Create an optimized device mesh for training MoE models."""
-    devices = jax.devices()
-    n_devices = len(devices)
-    
-    print(f"Found {n_devices} devices: {devices}")
-    
-    if n_devices == 0:
-        raise ValueError("No JAX devices found. Please check your JAX installation.")
-    
-    # Calculate optimal dimensions for device mesh
-    # For MoE models, we want to maximize expert parallelism first
-    # Then model parallelism, and finally batch parallelism
-    
-    # Determine optimal expert dimension based on model config
-    num_experts = MODEL_CONFIG['num_experts']
-    num_constant_experts = MODEL_CONFIG['num_constant_experts']
-    
-    # We need to ensure the expert dimension evenly divides both num_experts and num_constant_experts
-    # So we need to find the largest divisor of n_devices that is <= min(num_experts, num_constant_experts)
-    min_expert_dim = min(num_experts, num_constant_experts)
-    
-    # Try to find factors of n_devices that work well for expert sharding
-    possible_expert_dims = []
-    for i in range(1, min(min_expert_dim + 1, n_devices + 1)):
-        if n_devices % i == 0 and i <= min_expert_dim:
-            possible_expert_dims.append(i)
-    
-    # Choose the largest expert dimension that divides n_devices and is <= min_expert_dim
-    expert_dim = max(possible_expert_dims) if possible_expert_dims else 1
-    
-    # Now distribute remaining devices between model and batch dimensions
-    remaining_dims = n_devices // expert_dim
-    
-    # Ensure remaining_dims is at least 1
-    if remaining_dims < 1:
-        expert_dim = 1
-        remaining_dims = n_devices
-    
-    # Default to model_dim=1 for single device case
-    model_dim = 1
-    
-    # Prefer model parallelism over batch parallelism for better efficiency
-    # but ensure at least some batch parallelism
-    if remaining_dims > 1:
-        model_dim = 2
-        while remaining_dims % (model_dim * 2) == 0 and model_dim * 2 <= 8:  # Limit model dim to 8
-            model_dim *= 2
-    
-    batch_dim = max(1, remaining_dims // model_dim)
-    
-    # Verify our dimensions multiply to give the total number of devices
-    actual_devices = expert_dim * model_dim * batch_dim
-    if actual_devices != n_devices:
-        print(f"Warning: Calculated dimensions ({expert_dim}×{model_dim}×{batch_dim}={actual_devices}) " 
-              f"don't match total devices ({n_devices})")
-        # Fall back to a simpler configuration
-        if n_devices > 1:
-            expert_dim = 1
-            model_dim = 1
-            batch_dim = n_devices
-        else:
-            expert_dim = model_dim = batch_dim = 1
-    
-    print(f"Using 3D mesh with shape: expert={expert_dim}, model={model_dim}, batch={batch_dim}")
-    print(f"Total devices: {expert_dim * model_dim * batch_dim}")
-    
-    mesh = jax.make_mesh((expert_dim, model_dim, batch_dim), ('expert', 'model', 'batch'))
-    return mesh, n_devices
-
-def get_param_spec(param, path):
-    """Get parameter sharding specification based on parameter path and shape."""
-    path_str = str(path).lower()
-
-    # Handle 1D parameters (biases, scales, etc.)
-    if param.ndim == 1:
-        # For larger 1D parameters (>10k elements), shard across model dimension
-        if param.size > 10000:
-            return P('model')
-        # For smaller 1D parameters, replicate across all dimensions
-        return P(None)
-
-    # Handle constant experts specially to avoid expert dimension sharding issues
-    if 'constant_experts' in path_str:
-        if param.ndim == 2:  # Shape: (num_constant_experts, d_model)
-            return P(None, 'model')  # Don't shard on expert dimension
-        return P(None)
-
-    # Handle expert-related parameters
-    if 'experts' in path_str:
-        # Special case for feedforward experts keys and values
-        if ('feedforward_experts' in path_str or 'shared_experts' in path_str) and param.ndim == 3:
-            if 'keys' in path_str:  # Shape: (num_experts, hidden_size, d_model)
-                return P('expert', 'model', None)
-            elif 'values' in path_str:  # Shape: (num_experts, d_model, hidden_size)
-                return P('expert', 'model', None)
-        elif param.ndim == 3:  # Other 3D expert parameters
-            return P('expert', 'model', None)
-        elif param.ndim == 2:
-            return P('expert', 'model')
-        elif 'bias' in path_str:
-            return P('expert')
-
-    # Router parameters
-    if 'router' in path_str:
-        if 'gate' in path_str:
-            if 'kernel' in path_str and param.ndim == 2:
-                # Router gate kernels are 2D (input_dim, num_experts)
-                return P('expert', 'model')
-            elif 'bias' in path_str:
-                return P(None)
-        elif 'temperature' in path_str:
-            return P(None)
-
-    # Output projection and embedding layers
-    if 'lm_head' in path_str:
-        if 'kernel' in path_str and param.ndim == 2:
-            return P('expert', 'model')
-        elif 'bias' in path_str:
-            return P('model')  # Shard large vocabulary biases along model dim
-    
-    if 'embedding' in path_str and param.ndim == 2:
-        return P('expert', 'model')
-
-    # Attention layers
-    if 'attention' in path_str:
-        if ('q_proj' in path_str or 'k_proj' in path_str or 'v_proj' in path_str or 'out_proj' in path_str):
-            if 'kernel' in path_str and param.ndim == 2:
-                return P('expert', 'model')
-            elif 'bias' in path_str:
-                return P(None)
-
-    # Layer normalization parameters
-    if 'norm' in path_str or 'layernorm' in path_str or 'rmsnorm' in path_str:
-        return P(None)
-
-    # Size-based fallbacks
-    if param.size < 10000:
-        return P(None)
-
-    # Default for remaining 2D+ parameters
-    if param.ndim == 2:
-        return P('expert', 'model')
-    elif param.ndim >= 3:
-        return P('expert', 'model', None)
-
-    # Default fallback for any other parameters
-    return P(None)
-
-def validate_param_spec(param, spec):
-    """Validate that the parameter sharding specification is compatible with the parameter shape."""
-    if spec is None:
-        return True
-
-    # Count non-None axes in the spec
-    non_none_axes = sum(1 for axis in spec if axis is not None)
-
-    # Check if the number of non-None axes matches the parameter ndim
-    if non_none_axes > param.ndim:
-        return False
-
-    return True
-
-def get_param_spec_validated(param, path):
-    """Get validated parameter sharding specification."""
-    spec = get_param_spec(param, path)
-    
-    # Special case for lm_head bias which needs model dimension sharding
-    path_str = '/'.join(str(p) for p in path)
-    if 'lm_head' in path_str.lower() and 'bias' in path_str.lower() and param.ndim == 1:
-        return P('model')
-        
-    if not validate_param_spec(param, spec):
-        print(f"Warning: Invalid sharding spec for {path_str} with shape {param.shape}: {spec}")
-        # Fall back to a safe sharding spec based on parameter dimensions
-        if param.ndim == 0:
-            return P(None)
-        elif param.ndim == 1:
-            # For large 1D parameters (vocab biases), shard across model dim
-            if param.size > 10000:
-                return P('model')
-            return P(None)
-        elif param.ndim == 2:
-            # Most 2D parameters can be sharded across expert and model dimensions
-            return P('expert', 'model')
-        elif param.ndim == 3:
-            # 3D parameters usually have expert dimension first, then features
-            if 'expert' in str(path).lower():
-                return P('expert', 'model', None)
-            return P(None, 'model', None)
-        else:
-            # Higher dimensional tensors (rarely encountered)
-            return P(None)
-    return spec
 
 def save_cpu_only_checkpoint(state, async_checkpointer: ocp.AsyncCheckpointer, checkpoint_dir, name="best_model"):
     """
@@ -610,7 +427,7 @@ def prefetch(iterator, size):
         yield queue.popleft()
         enqueue(1)
 
-def create_prefetch_batches(dataset, indices, samples_per_step, mesh, start_idx=0, num_prefetch=4):
+def create_prefetch_batches(dataset, indices, samples_per_step, start_idx=0, num_prefetch=4):
     """Creates an iterator that prefetches batches while training."""
     batch_indices = [
         idx for idx in [
@@ -624,13 +441,13 @@ def create_prefetch_batches(dataset, indices, samples_per_step, mesh, start_idx=
     batch_indices = batch_indices[start_idx:]
 
     return prefetch(
-        map(lambda idx: create_batch(mesh, dataset[idx]), batch_indices),
+        map(lambda idx:(dataset[idx]), batch_indices),
         num_prefetch
     )
 
-def evaluate_model(state, test_dataset, mesh):
+def evaluate_model(state, test_dataset):
     """Evaluate the model on the test set."""
-    test_batch = create_batch(mesh, {
+    test_batch = create_batch({
         'input_ids': test_dataset['input_ids'],
         'attention_mask': test_dataset['attention_mask'],
         'labels': test_dataset['labels']
@@ -762,7 +579,6 @@ def main():
                 train_dataset,
                 shuffled_indices,
                 samples_per_step,
-                mesh,
                 start_idx=start_batch_idx if epoch == start_epoch else 0
             )
 
@@ -802,7 +618,7 @@ def main():
                             just_loaded = False
                         else:
                             print(f"\nStep {step}: Evaluating model...")
-                            test_metrics = evaluate_model(state, test_dataset, mesh)
+                            test_metrics = evaluate_model(state, test_dataset)
                             
                             if jax.process_index() == 0:
                                 wandb.log({
@@ -836,7 +652,7 @@ def main():
                     break
             
             # Evaluate on test set at end of epoch
-            test_metrics = evaluate_model(state, test_dataset, mesh)
+            test_metrics = evaluate_model(state, test_dataset)
             
             print(f"\nEpoch {epoch+1} Summary:")
             print(f"Test Loss: {test_metrics['loss']:.4f}, Perplexity: {test_metrics['perplexity']:.4f}")
