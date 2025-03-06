@@ -548,191 +548,196 @@ def main():
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Total steps: {total_steps}")
 
-    with mesh:
-        learning_rate_fn = create_learning_rate_schedule(
-            num_train_steps=total_steps,
-            warmup_steps=WARMUP_STEPS,
-            base_learning_rate=LEARNING_RATE
-        )
-
-        rng = jax.random.key(0)
-        rng, init_rng = jax.random.split(rng)
-
-        step = 0
-        state, state_sharding = create_train_state(
-            init_rng,
-            mesh=mesh,
-            learning_rate_fn=learning_rate_fn,
-            **MODEL_CONFIG
-        )
-
-        print(f"Syncing training state for process {jax.process_index()}")
-        sync_global_devices('training_state_created')
-        # Restore from checkpoint
-        just_loaded = False
-        latest_step = async_checkpoint_manager.latest_step()
-        if latest_step is not None:
-            print(f"Restoring from checkpoint at step {latest_step}")
-            step = latest_step
-            loaded_state = async_checkpoint_manager.restore(latest_step)
-            state = state.replace(params=loaded_state['state']['params'])
-            async_checkpoint_manager.wait_until_finished()
-            just_loaded = True
-        else:
-            print("No checkpoint found, training from scratch")
-
-        print(f"Syncing checkpoint loaded for process {jax.process_index()}")
-        sync_global_devices('checkpoint_loaded')
-
-        param_count = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
-        print(f"Number of parameters: {param_count/1e9:.2f}B")
-
-        if jax.process_index() == 0:
-            wandb.run.summary["model_parameters_B"] = param_count/1e9
-
-        start_epoch = step // steps_per_epoch
-        start_batch_idx = step % steps_per_epoch
-
-        print(f"Syncing starting training for process {jax.process_index()}")
-        sync_global_devices('starting_training')
-
-        print(f"Starting training from step {step} (epoch {start_epoch}, batch {start_batch_idx})")
-
-        # Track best metrics
-        best_metrics = {
-            'train_loss': float('inf'),
-            'test_loss': float('inf'),
-            'test_perplexity': float('inf')
-        }
-        plateau_count = 0
-        early_stop_patience = 3
-
-        # Create the training step function with proper sharding
-        train_step = create_train_step(mesh, state_sharding)
-
-        for epoch in range(start_epoch, NUM_EPOCHS):
-            shuffled_indices = np.random.RandomState(seed=epoch).permutation(len(train_dataset))
-
-            print(f"Syncing epoch {epoch} for process {jax.process_index()}")
-            sync_global_devices(f'epoch_{epoch}')
-
-            batch_iterator = create_prefetch_batches(
-                train_dataset,
-                shuffled_indices,
-                samples_per_step,
-                mesh,
-                start_idx=start_batch_idx if epoch == start_epoch else 0
+    # Start profiling
+    PROFILING_DIR = os.path.join(os.path.expanduser("~"), "profiling")
+    os.makedirs(PROFILING_DIR, exist_ok=True)
+    
+    with jax.profiler.trace(PROFILING_DIR, create_perfetto_link=(jax.process_index() == 0)):
+        with mesh:
+            learning_rate_fn = create_learning_rate_schedule(
+                num_train_steps=total_steps,
+                warmup_steps=WARMUP_STEPS,
+                base_learning_rate=LEARNING_RATE
             )
 
-            progress_bar = tqdm(
-                range(steps_per_epoch),
-                desc=f"Epoch {epoch+1}/{NUM_EPOCHS}",
-                position=0,
-                initial=start_batch_idx if epoch == start_epoch else 0
+            rng = jax.random.key(0)
+            rng, init_rng = jax.random.split(rng)
+
+            step = 0
+            state, state_sharding = create_train_state(
+                init_rng,
+                mesh=mesh,
+                learning_rate_fn=learning_rate_fn,
+                **MODEL_CONFIG
             )
 
-            for batch_idx in range(start_batch_idx if epoch == start_epoch else 0, steps_per_epoch):
-                try:
-                    batch = next(batch_iterator)
-                    state, metrics = train_step(state, batch, step, rng)
-                    progress_bar.update(1)
+            print(f"Syncing training state for process {jax.process_index()}")
+            sync_global_devices('training_state_created')
+            # Restore from checkpoint
+            just_loaded = False
+            latest_step = async_checkpoint_manager.latest_step()
+            if latest_step is not None:
+                print(f"Restoring from checkpoint at step {latest_step}")
+                step = latest_step
+                loaded_state = async_checkpoint_manager.restore(latest_step)
+                state = state.replace(params=loaded_state['state']['params'])
+                async_checkpoint_manager.wait_until_finished()
+                just_loaded = True
+            else:
+                print("No checkpoint found, training from scratch")
 
-                    if batch_idx % 50 == 0:
-                        metrics = {k: float(v) for k, v in metrics.items()}
-                        progress_bar.set_postfix({
-                            k: f"{v:.4f}" for k, v in metrics.items()
-                        })
+            print(f"Syncing checkpoint loaded for process {jax.process_index()}")
+            sync_global_devices('checkpoint_loaded')
 
-                        if jax.process_index() == 0:
-                            # Log learning rate and training metrics
-                            current_lr = float(learning_rate_fn(step))
-                            wandb.log({
-                                f"train/{k}": v for k, v in metrics.items()
-                            } | {
-                                'train/step': step,
-                                'train/epoch': epoch + (batch_idx / steps_per_epoch),
-                                'train/learning_rate': current_lr
+            param_count = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
+            print(f"Number of parameters: {param_count/1e9:.2f}B")
+
+            if jax.process_index() == 0:
+                wandb.run.summary["model_parameters_B"] = param_count/1e9
+
+            start_epoch = step // steps_per_epoch
+            start_batch_idx = step % steps_per_epoch
+
+            print(f"Syncing starting training for process {jax.process_index()}")
+            sync_global_devices('starting_training')
+
+            print(f"Starting training from step {step} (epoch {start_epoch}, batch {start_batch_idx})")
+
+            # Track best metrics
+            best_metrics = {
+                'train_loss': float('inf'),
+                'test_loss': float('inf'),
+                'test_perplexity': float('inf')
+            }
+            plateau_count = 0
+            early_stop_patience = 3
+
+            # Create the training step function with proper sharding
+            train_step = create_train_step(mesh, state_sharding)
+
+            for epoch in range(start_epoch, NUM_EPOCHS):
+                shuffled_indices = np.random.RandomState(seed=epoch).permutation(len(train_dataset))
+
+                print(f"Syncing epoch {epoch} for process {jax.process_index()}")
+                sync_global_devices(f'epoch_{epoch}')
+
+                batch_iterator = create_prefetch_batches(
+                    train_dataset,
+                    shuffled_indices,
+                    samples_per_step,
+                    mesh,
+                    start_idx=start_batch_idx if epoch == start_epoch else 0
+                )
+
+                progress_bar = tqdm(
+                    range(steps_per_epoch),
+                    desc=f"Epoch {epoch+1}/{NUM_EPOCHS}",
+                    position=0,
+                    initial=start_batch_idx if epoch == start_epoch else 0
+                )
+
+                for batch_idx in range(start_batch_idx if epoch == start_epoch else 0, steps_per_epoch):
+                    try:
+                        batch = next(batch_iterator)
+                        state, metrics = train_step(state, batch, step, rng)
+                        progress_bar.update(1)
+
+                        if batch_idx % 50 == 0:
+                            metrics = {k: float(v) for k, v in metrics.items()}
+                            progress_bar.set_postfix({
+                                k: f"{v:.4f}" for k, v in metrics.items()
                             })
 
-                    # Evaluate and save checkpoint
-                    if step % EVAL_STEPS == 0 and step != 0:
-                        if just_loaded:
-                            just_loaded = False
-                        else:
-                            print(f"\nStep {step}: Evaluating model...")
-                            test_metrics = evaluate_model(state, test_dataset, mesh)
-                            
                             if jax.process_index() == 0:
+                                # Log learning rate and training metrics
+                                current_lr = float(learning_rate_fn(step))
                                 wandb.log({
-                                    'test/loss': test_metrics['loss'],
-                                    'test/perplexity': test_metrics['perplexity'],
-                                    'test/step': step,
-                                    'test/epoch': epoch + (batch_idx / steps_per_epoch)
+                                    f"train/{k}": v for k, v in metrics.items()
+                                } | {
+                                    'train/step': step,
+                                    'train/epoch': epoch + (batch_idx / steps_per_epoch),
+                                    'train/learning_rate': current_lr
                                 })
+
+                        # Evaluate and save checkpoint
+                        if step % EVAL_STEPS == 0 and step != 0:
+                            if just_loaded:
+                                just_loaded = False
+                            else:
+                                print(f"\nStep {step}: Evaluating model...")
+                                test_metrics = evaluate_model(state, test_dataset, mesh)
                                 
-                                print(f"Test Loss: {test_metrics['loss']:.4f}, Perplexity: {test_metrics['perplexity']:.4f}")
-                            
-                            # Save checkpoint and best model if improved
-                            print(f"\nSaving checkpoint...")
-                            async_checkpoint_manager.save(step, {"state": state})
-                            
-                            if test_metrics['perplexity'] < best_metrics['test_perplexity']:
-                                best_metrics['test_perplexity'] = test_metrics['perplexity']
-                                best_metrics['test_loss'] = test_metrics['loss']
-                                save_cpu_only_checkpoint(
-                                    state, 
-                                    async_checkpointer, 
-                                    CHECKPOINT_DIR,
-                                    name="best_model"
-                                )
-                                print(f"New best perplexity: {test_metrics['perplexity']:.4f}")
+                                if jax.process_index() == 0:
+                                    wandb.log({
+                                        'test/loss': test_metrics['loss'],
+                                        'test/perplexity': test_metrics['perplexity'],
+                                        'test/step': step,
+                                        'test/epoch': epoch + (batch_idx / steps_per_epoch)
+                                    })
+                                    
+                                    print(f"Test Loss: {test_metrics['loss']:.4f}, Perplexity: {test_metrics['perplexity']:.4f}")
+                                
+                                # Save checkpoint and best model if improved
+                                print(f"\nSaving checkpoint...")
+                                async_checkpoint_manager.save(step, {"state": state})
+                                
+                                if test_metrics['perplexity'] < best_metrics['test_perplexity']:
+                                    best_metrics['test_perplexity'] = test_metrics['perplexity']
+                                    best_metrics['test_loss'] = test_metrics['loss']
+                                    save_cpu_only_checkpoint(
+                                        state, 
+                                        async_checkpointer, 
+                                        CHECKPOINT_DIR,
+                                        name="best_model"
+                                    )
+                                    print(f"New best perplexity: {test_metrics['perplexity']:.4f}")
 
-                    step += 1
+                        step += 1
 
-                except StopIteration:
-                    print(f"Reached end of dataset in epoch {epoch}")
-                    break
-            
-            # Evaluate on test set at end of epoch
-            test_metrics = evaluate_model(state, test_dataset, mesh)
-            
-            print(f"\nEpoch {epoch+1} Summary:")
-            print(f"Test Loss: {test_metrics['loss']:.4f}, Perplexity: {test_metrics['perplexity']:.4f}")
-            
-            # Check for improvement
-            if test_metrics['perplexity'] < best_metrics['test_perplexity']:
-                improvement = best_metrics['test_perplexity'] - test_metrics['perplexity']
-                best_metrics['test_perplexity'] = test_metrics['perplexity']
-                best_metrics['test_loss'] = test_metrics['loss']
-                plateau_count = 0
-                print(f"Test perplexity improved by {improvement:.4f}. New best: {test_metrics['perplexity']:.4f}")
+                    except StopIteration:
+                        print(f"Reached end of dataset in epoch {epoch}")
+                        break
                 
-                # Save best model
-                save_cpu_only_checkpoint(
-                    state,
-                    async_checkpointer,
-                    CHECKPOINT_DIR,
-                    name="best_model"
-                )
-            else:
-                plateau_count += 1
-                print(f"No improvement for {plateau_count} epochs. Best test perplexity: {best_metrics['test_perplexity']:.4f}")
+                # Evaluate on test set at end of epoch
+                test_metrics = evaluate_model(state, test_dataset, mesh)
                 
-                if plateau_count >= early_stop_patience:
-                    print(f"Early stopping after {early_stop_patience} epochs without improvement")
-                    break
-            
+                print(f"\nEpoch {epoch+1} Summary:")
+                print(f"Test Loss: {test_metrics['loss']:.4f}, Perplexity: {test_metrics['perplexity']:.4f}")
+                
+                # Check for improvement
+                if test_metrics['perplexity'] < best_metrics['test_perplexity']:
+                    improvement = best_metrics['test_perplexity'] - test_metrics['perplexity']
+                    best_metrics['test_perplexity'] = test_metrics['perplexity']
+                    best_metrics['test_loss'] = test_metrics['loss']
+                    plateau_count = 0
+                    print(f"Test perplexity improved by {improvement:.4f}. New best: {test_metrics['perplexity']:.4f}")
+                    
+                    # Save best model
+                    save_cpu_only_checkpoint(
+                        state,
+                        async_checkpointer,
+                        CHECKPOINT_DIR,
+                        name="best_model"
+                    )
+                else:
+                    plateau_count += 1
+                    print(f"No improvement for {plateau_count} epochs. Best test perplexity: {best_metrics['test_perplexity']:.4f}")
+                    
+                    if plateau_count >= early_stop_patience:
+                        print(f"Early stopping after {early_stop_patience} epochs without improvement")
+                        break
+                
+                if jax.process_index() == 0:
+                    wandb.log({
+                        'test/epoch_loss': test_metrics['loss'],
+                        'test/epoch_perplexity': test_metrics['perplexity'],
+                        'test/epoch_accuracy': test_metrics['accuracy'],
+                        'train/epoch': epoch + 1
+                    })
+
             if jax.process_index() == 0:
-                wandb.log({
-                    'test/epoch_loss': test_metrics['loss'],
-                    'test/epoch_perplexity': test_metrics['perplexity'],
-                    'test/epoch_accuracy': test_metrics['accuracy'],
-                    'train/epoch': epoch + 1
-                })
-
-        if jax.process_index() == 0:
-            wandb.finish()
-            jax.distributed.shutdown()
+                wandb.finish()
+                jax.distributed.shutdown()
 
 if __name__ == "__main__":
     main()
