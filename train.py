@@ -25,7 +25,7 @@ from flax import linen as nn
 
 # Constants
 CONTEXT_LENGTH = 512
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 NUM_EPOCHS = 10
 LEARNING_RATE = 1e-4
 WARMUP_STEPS = 500
@@ -169,63 +169,22 @@ def create_mesh():
     n_devices = len(devices)
     
     print(f"Found {n_devices} devices: {devices}")
+
+    expert_dim = 1
+    model_dim = 1
+    batch_dim = 1
     
     if n_devices == 0:
         raise ValueError("No JAX devices found. Please check your JAX installation.")
     
-    # Calculate optimal dimensions for device mesh
-    # For MoE models, we want to maximize expert parallelism first
-    # Then model parallelism, and finally batch parallelism
-    
-    # Determine optimal expert dimension based on model config
-    num_experts = MODEL_CONFIG['num_experts']
-    num_constant_experts = MODEL_CONFIG['num_constant_experts']
-    
-    # We need to ensure the expert dimension evenly divides both num_experts and num_constant_experts
-    # So we need to find the largest divisor of n_devices that is <= min(num_experts, num_constant_experts)
-    min_expert_dim = min(num_experts, num_constant_experts)
-    
-    # Try to find factors of n_devices that work well for expert sharding
-    possible_expert_dims = []
-    for i in range(1, min(min_expert_dim + 1, n_devices + 1)):
-        if n_devices % i == 0 and i <= min_expert_dim:
-            possible_expert_dims.append(i)
-    
-    # Choose the largest expert dimension that divides n_devices and is <= min_expert_dim
-    expert_dim = max(possible_expert_dims) if possible_expert_dims else 1
-    
-    # Now distribute remaining devices between model and batch dimensions
-    remaining_dims = n_devices // expert_dim
-    
-    # Ensure remaining_dims is at least 1
-    if remaining_dims < 1:
-        expert_dim = 1
-        remaining_dims = n_devices
-    
-    # Default to model_dim=1 for single device case
-    model_dim = 1
-    
-    # Prefer model parallelism over batch parallelism for better efficiency
-    # but ensure at least some batch parallelism
-    if remaining_dims > 1:
+    if n_devices % 4 == 0:
+        expert_dim = 4
+        model_dim = 1
+        batch_dim = n_devices // 4
+    elif n_devices % 8 == 0:
+        expert_dim = 4
         model_dim = 2
-        while remaining_dims % (model_dim * 2) == 0 and model_dim * 2 <= 8:  # Limit model dim to 8
-            model_dim *= 2
-    
-    batch_dim = max(1, remaining_dims // model_dim)
-    
-    # Verify our dimensions multiply to give the total number of devices
-    actual_devices = expert_dim * model_dim * batch_dim
-    if actual_devices != n_devices:
-        print(f"Warning: Calculated dimensions ({expert_dim}×{model_dim}×{batch_dim}={actual_devices}) " 
-              f"don't match total devices ({n_devices})")
-        # Fall back to a simpler configuration
-        if n_devices > 1:
-            expert_dim = 1
-            model_dim = 1
-            batch_dim = n_devices
-        else:
-            expert_dim = model_dim = batch_dim = 1
+        batch_dim = n_devices // 8
     
     print(f"Using 3D mesh with shape: expert={expert_dim}, model={model_dim}, batch={batch_dim}")
     print(f"Total devices: {expert_dim * model_dim * batch_dim}")
@@ -411,44 +370,12 @@ def create_batch(mesh, inputs):
     
     return examples
 
-def save_cpu_only_checkpoint(state, async_checkpointer: ocp.AsyncCheckpointer, checkpoint_dir, name="best_model"):
-    """
-    Saves a CPU-only version of the model parameters as a checkpoint.
-    
-    Args:
-        state: The current train state containing model parameters
-        async_checkpoint_manager: The checkpoint manager for saving
-        checkpoint_dir: Directory to save the checkpoint
-        name: Name for the checkpoint (default: "best_model")
-        optimize_for_inference: If True, reinitialize model with training=False
-    
-    Returns:
-        bool: True if a new checkpoint was saved, False otherwise
-    """
-    # Static variable to track best loss across function calls
-    
-    # Get a CPU device
-    cpu_device = jax.devices("cpu")[0]
-    
-    # First, get the parameters off their current devices (potentially sharded)
-    # Then transfer to CPU
-    with jax.default_device(cpu_device):
-        # Get model config without training flag        
-        # Properly copy parameters from devices to CPU
-        # First get from devices, then put to CPU
-        params_copy = jax.device_put(
-            jax.device_get(state.params),
-            cpu_device
-        )
-        
-        checkpoint_name = name
-        # Save only the parameters
-        checkpoint_data = {"params": params_copy}
-        
-        # Save the parameters-only checkpoint 
-        checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
-        async_checkpointer.save(checkpoint_path, checkpoint_data, force=True)
-    
+def save_param_ckpt(state, async_checkpointer: ocp.AsyncCheckpointer, checkpoint_dir, name="best_model"):
+    params_copy = jax.device_get(state.params)
+    checkpoint_name = name
+    checkpoint_data = {"params": params_copy}
+    checkpoint_path = os.path.join(checkpoint_dir, checkpoint_name)
+    async_checkpointer.save(checkpoint_path, checkpoint_data, force=True)
     print(f"\nParameters checkpoint saved at {os.path.join(checkpoint_dir, checkpoint_name)}")
     return True
 
@@ -552,7 +479,7 @@ def main():
     PROFILING_DIR = os.path.join(os.path.expanduser("~"), "profiling")
     os.makedirs(PROFILING_DIR, exist_ok=True)
     
-    with jax.profiler.trace(PROFILING_DIR, create_perfetto_link=(jax.process_index() == 0)):
+    with jax.profiler.trace(PROFILING_DIR, create_perfetto_link=(jax.process_index() == 0), create_perfetto_trace=True):
         with mesh:
             learning_rate_fn = create_learning_rate_schedule(
                 num_train_steps=total_steps,
@@ -684,7 +611,7 @@ def main():
                                 if test_metrics['perplexity'] < best_metrics['test_perplexity']:
                                     best_metrics['test_perplexity'] = test_metrics['perplexity']
                                     best_metrics['test_loss'] = test_metrics['loss']
-                                    save_cpu_only_checkpoint(
+                                    save_param_ckpt(
                                         state, 
                                         async_checkpointer, 
                                         CHECKPOINT_DIR,
@@ -713,7 +640,7 @@ def main():
                     print(f"Test perplexity improved by {improvement:.4f}. New best: {test_metrics['perplexity']:.4f}")
                     
                     # Save best model
-                    save_cpu_only_checkpoint(
+                    save_param_ckpt(
                         state,
                         async_checkpointer,
                         CHECKPOINT_DIR,
