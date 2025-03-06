@@ -7,7 +7,7 @@ import optax
 from datasets import load_dataset, load_from_disk
 from transformers import AutoTokenizer
 from flax.training import train_state
-from typing import Dict
+from typing import Dict, Tuple, Any
 from tqdm import tqdm
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 import wandb
@@ -17,7 +17,8 @@ import collections
 import itertools
 import orbax.checkpoint as ocp
 import random
-from functools import partial
+import functools
+from flax import linen as nn
 
 # This script trains a Transformer model with MoE (Mixture of Experts) architecture
 # It supports checkpoint saving and loading for resuming training from the last saved checkpoint
@@ -90,12 +91,15 @@ def create_train_state(
     mesh: Mesh,
     learning_rate_fn: optax.Schedule,
     **kwargs
-) -> train_state.TrainState:
+) -> Tuple[train_state.TrainState, Any]:
     """Creates initial TrainState with model initialization and optimizer setup."""
     model = Transformer(dtype=DTYPE, training=True, **kwargs)
-    rng, params_rng, dropout_rng, noise_rng = jax.random.split(rng, 4)
-    rngs = {'params': params_rng, 'dropout': dropout_rng, 'noise': noise_rng}
-
+    
+    # Create dummy inputs with proper sharding
+    dummy_input = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
+    dummy_mask = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
+    
+    # Create optimizer
     optimizer = optax.chain(
         optax.clip_by_global_norm(GRADIENT_CLIP_NORM),
         optax.adamw(
@@ -107,37 +111,58 @@ def create_train_state(
         )
     )
 
-    print("Initializing model on mesh...")
-    # Create dummy inputs with proper sharding
-    dummy_input = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
-    dummy_mask = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
-    
-    # Explicitly shard the dummy inputs to distribute initialization computation
-    # Use 'data' axis for batch dimension and None for sequence dimension
+    # Define initialization function
+    def init_fn(rng, x, mask, model, optimizer):
+        rng, params_rng, dropout_rng, noise_rng = jax.random.split(rng, 4)
+        rngs = {'params': params_rng, 'dropout': dropout_rng, 'noise': noise_rng}
+        variables = model.init(rngs, x, mask)
+        state = train_state.TrainState.create(
+            apply_fn=model.apply,
+            params=variables['params'],
+            tx=optimizer,
+            opt_state=optimizer.init(variables['params'])
+        )
+        return state
+
+    print("Computing sharding specs...")
+    # Get input sharding
     input_sharding = NamedSharding(mesh, P('data', None))
-    dummy_input = jax.device_put(dummy_input, input_sharding)
-    dummy_mask = jax.device_put(dummy_mask, input_sharding)
     
-    # Initialize model with sharded inputs
-    variables = model.init(rngs, dummy_input, dummy_mask)
-    
-    print("Creating optimizer state...")
-    opt_state = optimizer.init(variables['params'])
-    
-    state = train_state.TrainState.create(
-        apply_fn=model.apply,
-        params=variables['params'],
-        tx=optimizer,
-        opt_state=opt_state,
+    # Get abstract shapes and shardings
+    abstract_state = jax.eval_shape(
+        functools.partial(init_fn, model=model, optimizer=optimizer),
+        rng, dummy_input, dummy_mask
     )
     
-    print("Train state created successfully")
+    # Get state sharding from model annotations
+    state_sharding = nn.get_sharding(abstract_state, mesh)
+    
+    print("JIT-compiling initialization...")
+    # JIT compile the initialization with proper shardings
+    jit_init = jax.jit(
+        init_fn,
+        static_argnums=(3, 4),  # model and optimizer are static
+        in_shardings=(
+            NamedSharding(mesh, P()),  # PRNG key
+            input_sharding,  # input
+            input_sharding,  # mask
+        ),
+        out_shardings=state_sharding
+    )
+    
+    print("Initializing parameters on devices...")
+    # Place inputs on devices with proper sharding
+    sharded_input = jax.device_put(dummy_input, input_sharding)
+    sharded_mask = jax.device_put(dummy_mask, input_sharding)
+    
+    # Initialize state with proper sharding
+    state = jit_init(rng, sharded_input, sharded_mask, model, optimizer)
     
     # Print total parameter count
-    param_count = sum(p.size for p in jax.tree.leaves(variables['params']))
+    param_count = sum(p.size for p in jax.tree.leaves(state.params))
     print(f"Total parameters: {param_count:,}")
     
-    return state
+    return state, state_sharding
 
 def create_mesh():
     """Create an optimized device mesh for training MoE models."""
@@ -237,33 +262,56 @@ def calculate_metrics(logits, labels, mask):
         'perplexity': perplexity
     }
 
-@jax.jit
-def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], step: int, rngs: jax.random.PRNGKey):
-    """Perform a single training step."""
-    noise_rng = jax.random.fold_in(rngs, step)
-
-    def loss_fn(params):
-        logits, router_loss = state.apply_fn(
-            {'params': params},
-            batch['input_ids'],
-            batch['attention_mask'],
-            rngs={'noise': noise_rng}
-        )
-        
-        metrics = calculate_metrics(logits, batch['labels'], batch['attention_mask'])
-        total_loss = metrics['loss'] + router_loss
-        
-        return total_loss, (metrics, router_loss)
-
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (total_loss, (metrics, router_loss)), grads = grad_fn(state.params)
-    new_state = state.apply_gradients(grads=grads)
-
-    metrics['router_loss'] = router_loss
-    metrics['total_loss'] = total_loss
+def create_train_step(mesh, state_sharding):
+    """Creates a sharded training step function."""
     
-    return new_state, metrics
+    # Define input shardings for batch
+    batch_sharding = {
+        'input_ids': NamedSharding(mesh, P('data', None)),
+        'attention_mask': NamedSharding(mesh, P('data', None)),
+        'labels': NamedSharding(mesh, P('data', None))
+    }
+    
+    # Define sharding for PRNG key
+    rng_sharding = NamedSharding(mesh, P())
+    
+    @functools.partial(
+        jax.jit,
+        in_shardings=(
+            state_sharding,  # state sharding
+            batch_sharding,  # batch sharding
+            rng_sharding,   # step (converted to PRNGKey) sharding
+            rng_sharding,   # rngs sharding
+        ),
+        out_shardings=(state_sharding, None)  # state and metrics sharding
+    )
+    def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], step: int, rngs: jax.random.PRNGKey):
+        """Perform a single training step."""
+        noise_rng = jax.random.fold_in(rngs, step)
 
+        def loss_fn(params):
+            logits, router_loss = state.apply_fn(
+                {'params': params},
+                batch['input_ids'],
+                batch['attention_mask'],
+                rngs={'noise': noise_rng}
+            )
+            
+            metrics = calculate_metrics(logits, batch['labels'], batch['attention_mask'])
+            total_loss = metrics['loss'] + router_loss
+            
+            return total_loss, (metrics, router_loss)
+
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (total_loss, (metrics, router_loss)), grads = grad_fn(state.params)
+        new_state = state.apply_gradients(grads=grads)
+
+        metrics['router_loss'] = router_loss
+        metrics['total_loss'] = total_loss
+        
+        return new_state, metrics
+    
+    return train_step
 @jax.jit
 def test_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray]):
     """Perform a single test step."""
@@ -347,7 +395,7 @@ def prepare_dataset(tokenizer):
     
     return train_dataset, test_dataset, len(train_dataset)
 
-def create_batch(inputs):
+def create_batch(mesh, inputs):
     """Create a batch from dataset examples."""
     examples = {}
     for k, v in inputs.items():
@@ -357,26 +405,11 @@ def create_batch(inputs):
                 else list(mask) + [0] * (CONTEXT_LENGTH - len(mask))
                 for mask in v
             ]
-            examples[k] = jnp.array(masks)
+            examples[k] = jax.device_put(jnp.array(masks), NamedSharding(mesh, P('data', None)))
         else:
-            examples[k] = jnp.array(v)
+            examples[k] = jax.device_put(jnp.array(v), NamedSharding(mesh, P('data', None)))
     
     return examples
-
-def get_sharding_spec(ndim: int) -> P:
-    """Helper function to determine sharding spec based on tensor rank."""
-    if ndim == 3:
-        # For 3D tensors (batch, seq_len, features)
-        return P(None, None, 'batch')
-    elif ndim == 2:
-        # For 2D tensors (batch, seq_len)
-        return P(None, 'batch')
-    elif ndim == 1:
-        # For 1D tensors
-        return P(None)
-    else:
-        # Default fallback
-        return P(None)
 
 def save_cpu_only_checkpoint(state, async_checkpointer: ocp.AsyncCheckpointer, checkpoint_dir, name="best_model"):
     """
@@ -432,7 +465,7 @@ def prefetch(iterator, size):
         yield queue.popleft()
         enqueue(1)
 
-def create_prefetch_batches(dataset, indices, samples_per_step, start_idx=0, num_prefetch=4):
+def create_prefetch_batches(dataset, indices, samples_per_step, mesh, start_idx=0, num_prefetch=4):
     """Creates an iterator that prefetches batches while training."""
     batch_indices = [
         idx for idx in [
@@ -446,13 +479,13 @@ def create_prefetch_batches(dataset, indices, samples_per_step, start_idx=0, num
     batch_indices = batch_indices[start_idx:]
 
     return prefetch(
-        map(lambda idx:(dataset[idx]), batch_indices),
+        map(lambda idx: create_batch(mesh, dataset[idx]), batch_indices),
         num_prefetch
     )
 
-def evaluate_model(state, test_dataset):
+def evaluate_model(state, test_dataset, mesh):
     """Evaluate the model on the test set."""
-    test_batch = create_batch({
+    test_batch = create_batch(mesh, {
         'input_ids': test_dataset['input_ids'],
         'attention_mask': test_dataset['attention_mask'],
         'labels': test_dataset['labels']
@@ -526,11 +559,11 @@ def main():
         rng, init_rng = jax.random.split(rng)
 
         step = 0
-        state = create_train_state(
-          init_rng,
-          mesh=mesh,
-          **MODEL_CONFIG,
-          learning_rate_fn=learning_rate_fn
+        state, state_sharding = create_train_state(
+            init_rng,
+            mesh=mesh,
+            learning_rate_fn=learning_rate_fn,
+            **MODEL_CONFIG
         )
 
         print(f"Syncing training state for process {jax.process_index()}")
@@ -574,6 +607,9 @@ def main():
         plateau_count = 0
         early_stop_patience = 3
 
+        # Create the training step function with proper sharding
+        train_step = create_train_step(mesh, state_sharding)
+
         for epoch in range(start_epoch, NUM_EPOCHS):
             shuffled_indices = np.random.RandomState(seed=epoch).permutation(len(train_dataset))
 
@@ -584,6 +620,7 @@ def main():
                 train_dataset,
                 shuffled_indices,
                 samples_per_step,
+                mesh,
                 start_idx=start_batch_idx if epoch == start_epoch else 0
             )
 
@@ -623,7 +660,7 @@ def main():
                             just_loaded = False
                         else:
                             print(f"\nStep {step}: Evaluating model...")
-                            test_metrics = evaluate_model(state, test_dataset)
+                            test_metrics = evaluate_model(state, test_dataset, mesh)
                             
                             if jax.process_index() == 0:
                                 wandb.log({
@@ -657,7 +694,7 @@ def main():
                     break
             
             # Evaluate on test set at end of epoch
-            test_metrics = evaluate_model(state, test_dataset)
+            test_metrics = evaluate_model(state, test_dataset, mesh)
             
             print(f"\nEpoch {epoch+1} Summary:")
             print(f"Test Loss: {test_metrics['loss']:.4f}, Perplexity: {test_metrics['perplexity']:.4f}")
