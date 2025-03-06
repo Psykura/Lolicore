@@ -289,12 +289,11 @@ def create_train_step(mesh, state_sharding):
         noise_rng = jax.random.fold_in(rngs, step)
 
         def loss_fn(params):
-            # Pass rngs directly in the variables dict
-            variables = {'params': params, 'noise': noise_rng}
             logits, router_loss = state.apply_fn(
-                variables,
+                {'params': params},
                 batch['input_ids'],
-                batch['attention_mask']
+                batch['attention_mask'],
+                rngs={'noise': noise_rng}
             )
             
             metrics = calculate_metrics(logits, batch['labels'], batch['attention_mask'])
