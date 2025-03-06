@@ -430,10 +430,10 @@ class Router(nn.Module):
         
         # Apply partitioning constraints to top-k outputs
         expert_gate = partitioning.with_sharding_constraint(
-            expert_gate, ('data', None, 'expert')  # (batch, seq, top_k)
+            expert_gate, ('data', None, None)  # (batch, seq, top_k)
         )
         expert_index = partitioning.with_sharding_constraint(
-            expert_index, ('data', None, 'expert')  # (batch, seq, top_k)
+            expert_index, ('data', None, None)  # (batch, seq, top_k)
         )
 
         # Resulting shape: [G, S, top_k, E]
@@ -441,7 +441,7 @@ class Router(nn.Module):
         
         # Apply partitioning constraint to expert mask
         expert_mask = partitioning.with_sharding_constraint(
-            expert_mask, ('data', None, 'expert', 'expert')  # (batch, seq, top_k, num_experts)
+            expert_mask, ('data', None, None, 'expert')  # (batch, seq, top_k, num_experts)
         )
 
         # Shape: [G, S, E]
@@ -464,7 +464,7 @@ class Router(nn.Module):
         
         # Apply partitioning constraint to position_in_expert
         position_in_expert = partitioning.with_sharding_constraint(
-            position_in_expert, ('data', None, 'expert', 'expert')  # (batch, seq, top_k, num_experts)
+            position_in_expert, ('data', None, None, 'expert')  # (batch, seq, top_k, num_experts)
         )
 
         # Shape: [G, S, top_k, E]
@@ -472,7 +472,7 @@ class Router(nn.Module):
         
         # Apply partitioning constraint to valid_assignment
         valid_assignment = partitioning.with_sharding_constraint(
-            valid_assignment, ('data', None, 'expert', 'expert')  # (batch, seq, top_k, num_experts)
+            valid_assignment, ('data', None, None, 'expert')  # (batch, seq, top_k, num_experts)
         )
 
         # Shape: [G, S, top_k, E]
@@ -480,7 +480,7 @@ class Router(nn.Module):
         
         # Apply partitioning constraint to expert_gate_valid
         expert_gate_valid = partitioning.with_sharding_constraint(
-            expert_gate_valid, ('data', None, 'expert', 'expert')  # (batch, seq, top_k, num_experts)
+            expert_gate_valid, ('data', None, None, 'expert')  # (batch, seq, top_k, num_experts)
         )
 
         # Shape: [G, S, top_k, E, expert_capacity].
@@ -491,7 +491,7 @@ class Router(nn.Module):
         
         # Apply partitioning constraint to combine_tensor_per_assignment
         combine_tensor_per_assignment = partitioning.with_sharding_constraint(
-            combine_tensor_per_assignment, ('data', None, 'expert', 'expert', None)  # (batch, seq, top_k, num_experts, expert_capacity)
+            combine_tensor_per_assignment, ('data', None, None, 'expert', None)  # (batch, seq, top_k, num_experts, expert_capacity)
         )
 
         # Shape: [G, S, E, expert_capacity]

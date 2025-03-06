@@ -25,7 +25,7 @@ from flax import linen as nn
 
 # Constants
 CONTEXT_LENGTH = 512
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 NUM_EPOCHS = 10
 LEARNING_RATE = 1e-4
 WARMUP_STEPS = 500
@@ -46,11 +46,11 @@ MODEL_CONFIG = {
     'hidden_size': 2048,
     'max_seq_length': CONTEXT_LENGTH,
     'vocab_size': vocab_size,  # GPT-2 vocab size
-    'num_experts': 20 + 2 + 2,
+    'num_experts': 20 + 4 + 0,
     'num_shared_experts': 2,
     'use_gradient_checkpointing': True,
     'attention_latent_dim': 64,
-    'num_constant_experts': 2,
+    'num_constant_experts': 4,
     'num_noise_experts': 0,
     'top_k': 2,
 }
