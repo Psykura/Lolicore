@@ -42,7 +42,7 @@ MODEL_CONFIG = {
     'num_blocks': 12,
     'num_heads': 8,
     'd_model': 768,
-    'hidden_size': 8192,
+    'hidden_size': 4096,
     'max_seq_length': CONTEXT_LENGTH,
     'vocab_size': vocab_size,  # GPT-2 vocab size
     'num_experts': 16 + 2 + 2,
