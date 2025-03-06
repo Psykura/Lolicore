@@ -460,6 +460,9 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True)
     train_dataset, test_dataset, dataset_size = prepare_dataset(tokenizer)
 
+    print("Initializing JAX distributed...")
+    jax.distributed.initialize()
+
     try:
         from jax_smi import initialise_tracking
         initialise_tracking()
@@ -495,6 +498,8 @@ def main():
     sync_global_devices('mesh_created')
 
     # Initialize async checkpoint manager
+    async_checkpointer = ocp.AsyncCheckpointer(ocp.PyTreeCheckpointHandler(), timeout_secs=50)
+    async_checkpoint_manager = ocp.CheckpointManager(CHECKPOINT_DIR, async_checkpointer, options=ocp.CheckpointManagerOptions(max_to_keep=2))
 
     samples_per_step = BATCH_SIZE
     steps_per_epoch = len(train_dataset) // samples_per_step
@@ -525,11 +530,6 @@ def main():
 
         print(f"Syncing training state for process {jax.process_index()}")
         sync_global_devices('training_state_created')
-
-        jax.distributed.initialize()
-        async_checkpointer = ocp.AsyncCheckpointer(ocp.PyTreeCheckpointHandler(), timeout_secs=50)
-        async_checkpoint_manager = ocp.CheckpointManager(CHECKPOINT_DIR, async_checkpointer, options=ocp.CheckpointManagerOptions(max_to_keep=2))
-
         # Restore from checkpoint
         just_loaded = False
         latest_step = async_checkpoint_manager.latest_step()
