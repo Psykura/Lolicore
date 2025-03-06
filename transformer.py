@@ -72,38 +72,41 @@ class MultiHeadAttention(nn.Module):
         )
 
         dense_impl = nn.remat(nn.Dense) if self.use_gradient_checkpointing else nn.Dense
+        # Input projections: partition the output dim (head_dim) along the model axis
+        # Input: [batch, seq, d_model] -> Output: [batch, seq, head_dim]
         self.q_proj = dense_impl(
             features=self.head_dim,
-            kernel_init=nn.with_partitioning(self.kernel_init, ('model', 'expert')),
+            kernel_init=nn.with_partitioning(self.kernel_init, (None, 'model')),
             bias_init=nn.with_partitioning(nn.initializers.zeros, ('model',)),
             dtype=self.dtype
         )
         self.k_proj = dense_impl(
             features=self.head_dim,
-            kernel_init=nn.with_partitioning(self.kernel_init, ('model', 'expert')),
+            kernel_init=nn.with_partitioning(self.kernel_init, (None, 'model')),
             bias_init=nn.with_partitioning(nn.initializers.zeros, ('model',)),
             dtype=self.dtype
         )
         self.v_proj = dense_impl(
             features=self.head_dim,
-            kernel_init=nn.with_partitioning(self.kernel_init, ('model', 'expert')),
+            kernel_init=nn.with_partitioning(self.kernel_init, (None, 'model')),
             bias_init=nn.with_partitioning(nn.initializers.zeros, ('model',)),
             dtype=self.dtype
         )
-        # Output projection: partition across both model and expert dimensions
+        # Output projection: partition the input dim (head_dim) along the model axis
+        # Input: [batch, seq, head_dim] -> Output: [batch, seq, d_model]
         self.out_proj = dense_impl(
             features=self.d_model,
-            kernel_init=nn.with_partitioning(self.kernel_init, ('expert', 'model')),
-            bias_init=nn.with_partitioning(nn.initializers.zeros, ('model',)),
+            kernel_init=nn.with_partitioning(self.kernel_init, ('model', None)),
+            bias_init=nn.with_partitioning(nn.initializers.zeros, (None,)),
             dtype=self.dtype
         )
 
     def _compute_qkv(self, x):
         batch_size, seq_len, _ = x.shape
 
-        # Apply data and model partitioning constraint to the input
+        # Apply data partitioning constraint to the input
         x = partitioning.with_sharding_constraint(
-            x, ('data', None, ('model', None))  # (batch, seq, d_model)
+            x, ('data', None, None)  # (batch, seq, d_model)
         )
 
         # Project inputs to q, k, v
@@ -113,13 +116,13 @@ class MultiHeadAttention(nn.Module):
 
         # Apply partitioning constraints after projection and reshaping
         q = partitioning.with_sharding_constraint(
-            q, ('data', None, 'expert', 'model')  # (batch, seq, heads, latent_dim)
+            q, ('data', None, None, 'model')  # (batch, seq, heads, latent_dim)
         )
         k = partitioning.with_sharding_constraint(
-            k, ('data', None, 'expert', 'model')
+            k, ('data', None, None, 'model')
         )
         v = partitioning.with_sharding_constraint(
-            v, ('data', None, 'expert', 'model')
+            v, ('data', None, None, 'model')
         )
         
         # apply rotary embeddings
@@ -132,13 +135,13 @@ class MultiHeadAttention(nn.Module):
 
         # Apply partitioning constraints after transpose
         q = partitioning.with_sharding_constraint(
-            q, ('data', 'expert', None, 'model')  # (batch, heads, seq, latent_dim)
+            q, ('data', None, None, 'model')  # (batch, heads, seq, latent_dim)
         )
         k = partitioning.with_sharding_constraint(
-            k, ('data', 'expert', None, 'model')
+            k, ('data', None, None, 'model')
         )
         v = partitioning.with_sharding_constraint(
-            v, ('data', 'expert', None, 'model')
+            v, ('data', None, None, 'model')
         )
 
         return q, k, v
@@ -154,7 +157,7 @@ class MultiHeadAttention(nn.Module):
         
         # Apply partitioning constraint to attention scores
         scores = partitioning.with_sharding_constraint(
-            scores, ('data', 'expert', None, None)  # (batch, heads, seq_q, seq_k)
+            scores, ('data', None, None, None)  # (batch, heads, seq_q, seq_k)
         )
         
         # Standard causal mask
@@ -170,7 +173,7 @@ class MultiHeadAttention(nn.Module):
         
         # Apply partitioning constraint to attention weights
         attn_weights = partitioning.with_sharding_constraint(
-            attn_weights, ('data', 'expert', None, None)  # (batch, heads, seq_q, seq_k)
+            attn_weights, ('data', None, None, None)  # (batch, heads, seq_q, seq_k)
         )
         
         # Apply input attention mask after softmax to prevent NaN issues
@@ -188,7 +191,7 @@ class MultiHeadAttention(nn.Module):
         
         # Apply partitioning constraint to attention output
         attended = partitioning.with_sharding_constraint(
-            attended, ('data', 'expert', None, 'model')  # (batch, heads, seq, latent_dim)
+            attended, ('data', None, None, 'model')  # (batch, heads, seq, latent_dim)
         )
         
         # Transpose back to [batch, seq, heads, latent_dim]
@@ -196,7 +199,7 @@ class MultiHeadAttention(nn.Module):
         
         # Apply partitioning constraint after transpose
         attended = partitioning.with_sharding_constraint(
-            attended, ('data', None, 'expert', 'model')  # (batch, seq, heads, latent_dim)
+            attended, ('data', None, None, 'model')  # (batch, seq, heads, latent_dim)
         )
         
         # Reshape to [batch, seq, head_dim]
@@ -204,7 +207,7 @@ class MultiHeadAttention(nn.Module):
         
         # Apply partitioning constraint after reshape
         attended = partitioning.with_sharding_constraint(
-            attended, ('data', None, ('model', 'expert'))  # (batch, seq, head_dim)
+            attended, ('data', None, 'model')  # (batch, seq, head_dim)
         )
         
         # Project to output space
@@ -212,7 +215,7 @@ class MultiHeadAttention(nn.Module):
         
         # Final partitioning constraint
         output = partitioning.with_sharding_constraint(
-            output, ('data', None, ('model', None))  # (batch, seq, d_model)
+            output, ('data', None, None)  # (batch, seq, d_model)
         )
         
         return output
@@ -228,19 +231,19 @@ class FeedForward(nn.Module):
     
     def setup(self):
         # keys: [num_experts, hidden_size, d_model]
-        # Partition across expert and model dimensions for better parallelism
+        # Partition across expert and model dimensions
         self.keys = self.param(
             'keys',
-            nn.with_partitioning(self.kernel_init, ('expert', ('model', 'expert'), None)),
+            nn.with_partitioning(self.kernel_init, ('expert', 'model', None)),
             (self.num_experts, self.hidden_size, self.d_model),
             dtype=self.dtype
         )
         
         # values: [num_experts, d_model, hidden_size]
-        # Partition across expert and model dimensions for better parallelism
+        # Partition across expert and model dimensions
         self.values = self.param(
             'values',
-            nn.with_partitioning(self.kernel_init, ('expert', None, ('model', 'expert'))),
+            nn.with_partitioning(self.kernel_init, ('expert', None, 'model')),
             (self.num_experts, self.d_model, self.hidden_size),
             dtype=self.dtype
         )
@@ -249,9 +252,9 @@ class FeedForward(nn.Module):
     def __call__(self, x):
         # x shape: [batch, seq, num_experts, d_model]
         
-        # Apply partitioning constraint to input with model dimension
+        # Apply partitioning constraint to input
         x = partitioning.with_sharding_constraint(
-            x, ('data', None, 'expert', ('model', None))  # (batch, seq, num_experts, d_model)
+            x, ('data', None, 'expert', None)  # (batch, seq, num_experts, d_model)
         )
         
         # First projection: x @ keys
@@ -261,7 +264,7 @@ class FeedForward(nn.Module):
         
         # Apply partitioning constraint after first projection
         hidden = partitioning.with_sharding_constraint(
-            hidden, ('data', None, 'expert', ('model', 'expert'))  # (batch, seq, num_experts, hidden_size)
+            hidden, ('data', None, 'expert', 'model')  # (batch, seq, num_experts, hidden_size)
         )
         
         # Apply activation
@@ -274,15 +277,15 @@ class FeedForward(nn.Module):
         
         # Apply final partitioning constraint
         output = partitioning.with_sharding_constraint(
-            output, ('data', None, 'expert', ('model', None))  # (batch, seq, num_experts, d_model)
+            output, ('data', None, 'expert', None)  # (batch, seq, num_experts, d_model)
         )
         
         return output
         
     def process_by_indices(self, x, expert_indices, expert_weights):
-        # Apply partitioning constraint to input with model dimension
+        # Apply partitioning constraint to input
         x = partitioning.with_sharding_constraint(
-            x, ('data', None, ('model', None))  # (batch, seq, d_model)
+            x, ('data', None, None)  # (batch, seq, d_model)
         )
         
         # expert_indices shape: [batch, seq, top_k]
@@ -292,10 +295,10 @@ class FeedForward(nn.Module):
         
         # Apply partitioning constraints to selected parameters
         selected_keys = partitioning.with_sharding_constraint(
-            selected_keys, ('data', None, 'expert', ('model', 'expert'), None)  # (batch, seq, top_k, hidden_size, d_model)
+            selected_keys, ('data', None, 'expert', 'model', None)  # (batch, seq, top_k, hidden_size, d_model)
         )
         selected_values = partitioning.with_sharding_constraint(
-            selected_values, ('data', None, 'expert', None, ('model', 'expert'))  # (batch, seq, top_k, d_model, hidden_size)
+            selected_values, ('data', None, 'expert', None, 'model')  # (batch, seq, top_k, d_model, hidden_size)
         )
         
         # [batch, seq, d_model] @ [batch, seq, top_k, hidden_size, d_model] -> [batch, seq, top_k, hidden_size]
@@ -303,7 +306,7 @@ class FeedForward(nn.Module):
         
         # Apply partitioning constraint after first projection
         hidden = partitioning.with_sharding_constraint(
-            hidden, ('data', None, 'expert', ('model', 'expert'))  # (batch, seq, top_k, hidden_size)
+            hidden, ('data', None, 'expert', 'model')  # (batch, seq, top_k, hidden_size)
         )
         
         hidden = self.activation(hidden)
@@ -314,7 +317,7 @@ class FeedForward(nn.Module):
         
         # Apply final partitioning constraint
         final_output = partitioning.with_sharding_constraint(
-            final_output, ('data', None, ('model', None))  # (batch, seq, d_model)
+            final_output, ('data', None, None)  # (batch, seq, d_model)
         )
         
         return final_output
@@ -334,10 +337,10 @@ class Router(nn.Module):
 
     def setup(self):
         # Initialize gating network
-        # Partition input dim (d_model) along model and output dim (num_experts) along expert
+        # Partition input dim (d_model) along None and output dim (num_experts) along expert
         self.gate = nn.Dense(
             features=self.num_experts,
-            kernel_init=nn.with_partitioning(self.kernel_init, ('model', 'expert')),
+            kernel_init=nn.with_partitioning(self.kernel_init, (None, 'expert')),
             bias_init=nn.with_partitioning(nn.initializers.zeros, ('expert',)),
             dtype=self.dtype
         )
@@ -369,7 +372,7 @@ class Router(nn.Module):
     def _eval_routing(self, x):
         # Apply partitioning constraint to input
         x = partitioning.with_sharding_constraint(
-            x, ('data', None, ('model', None))  # (batch, seq, d_model)
+            x, ('data', None, None)  # (batch, seq, d_model)
         )
         
         gating_logits = self.gate(x)
@@ -403,7 +406,7 @@ class Router(nn.Module):
     def __call__(self, x, expert_capacity: int):
         # Apply partitioning constraint to input
         x = partitioning.with_sharding_constraint(
-            x, ('data', None, ('model', None))  # (batch, seq, d_model)
+            x, ('data', None, None)  # (batch, seq, d_model)
         )
         
         # Compute gating probabilities for each token: shape [G, S, E]
@@ -427,10 +430,10 @@ class Router(nn.Module):
         
         # Apply partitioning constraints to top-k outputs
         expert_gate = partitioning.with_sharding_constraint(
-            expert_gate, ('data', None, 'expert')  # (batch, seq, top_k)
+            expert_gate, ('data', None, None)  # (batch, seq, top_k)
         )
         expert_index = partitioning.with_sharding_constraint(
-            expert_index, ('data', None, 'expert')  # (batch, seq, top_k)
+            expert_index, ('data', None, None)  # (batch, seq, top_k)
         )
 
         # Resulting shape: [G, S, top_k, E]
@@ -438,7 +441,7 @@ class Router(nn.Module):
         
         # Apply partitioning constraint to expert mask
         expert_mask = partitioning.with_sharding_constraint(
-            expert_mask, ('data', None, 'expert', 'expert')  # (batch, seq, top_k, num_experts)
+            expert_mask, ('data', None, None, 'expert')  # (batch, seq, top_k, num_experts)
         )
 
         # Shape: [G, S, E]
@@ -461,7 +464,7 @@ class Router(nn.Module):
         
         # Apply partitioning constraint to position_in_expert
         position_in_expert = partitioning.with_sharding_constraint(
-            position_in_expert, ('data', None, 'expert', 'expert')  # (batch, seq, top_k, num_experts)
+            position_in_expert, ('data', None, None, 'expert')  # (batch, seq, top_k, num_experts)
         )
 
         # Shape: [G, S, top_k, E]
@@ -469,7 +472,7 @@ class Router(nn.Module):
         
         # Apply partitioning constraint to valid_assignment
         valid_assignment = partitioning.with_sharding_constraint(
-            valid_assignment, ('data', None, 'expert', 'expert')  # (batch, seq, top_k, num_experts)
+            valid_assignment, ('data', None, None, 'expert')  # (batch, seq, top_k, num_experts)
         )
 
         # Shape: [G, S, top_k, E]
@@ -477,10 +480,10 @@ class Router(nn.Module):
         
         # Apply partitioning constraint to expert_gate_valid
         expert_gate_valid = partitioning.with_sharding_constraint(
-            expert_gate_valid, ('data', None, 'expert', 'expert')  # (batch, seq, top_k, num_experts)
+            expert_gate_valid, ('data', None, None, 'expert')  # (batch, seq, top_k, num_experts)
         )
 
-        # Shape: [G, S, top_k, E, expert_capacity]
+        # Shape: [G, S, top_k, E, expert_capacity].
         combine_tensor_per_assignment = (
             expert_gate_valid[..., None] *
             jax.nn.one_hot(position_in_expert, num_classes=expert_capacity)
@@ -488,7 +491,7 @@ class Router(nn.Module):
         
         # Apply partitioning constraint to combine_tensor_per_assignment
         combine_tensor_per_assignment = partitioning.with_sharding_constraint(
-            combine_tensor_per_assignment, ('data', None, 'expert', 'expert', None)  # (batch, seq, top_k, num_experts, expert_capacity)
+            combine_tensor_per_assignment, ('data', None, None, 'expert', None)  # (batch, seq, top_k, num_experts, expert_capacity)
         )
 
         # Shape: [G, S, E, expert_capacity]
@@ -496,7 +499,7 @@ class Router(nn.Module):
         
         # Apply partitioning constraint to combine_tensor
         combine_tensor = partitioning.with_sharding_constraint(
-            combine_tensor, ('data', None, ('expert', 'model'), None)  # (batch, seq, num_experts, expert_capacity)
+            combine_tensor, ('data', None, 'expert', None)  # (batch, seq, num_experts, expert_capacity)
         )
 
         # Often the 0th capacity slot is unused (or reserved), so we slice it off.
@@ -504,7 +507,7 @@ class Router(nn.Module):
         
         # Apply partitioning constraint after slicing
         combine_tensor = partitioning.with_sharding_constraint(
-            combine_tensor, ('data', None, ('expert', 'model'), None)  # (batch, seq, num_experts, expert_capacity-1)
+            combine_tensor, ('data', None, 'expert', None)  # (batch, seq, num_experts, expert_capacity-1)
         )
 
         # Create a boolean mask indicating which positions are valid.
@@ -512,7 +515,7 @@ class Router(nn.Module):
         
         # Apply partitioning constraint to dispatch_mask
         dispatch_mask = partitioning.with_sharding_constraint(
-            dispatch_mask, ('data', None, ('expert', 'model'), None)  # (batch, seq, num_experts, expert_capacity-1)
+            dispatch_mask, ('data', None, 'expert', None)  # (batch, seq, num_experts, expert_capacity-1)
         )
         
         return combine_tensor, dispatch_mask, loss

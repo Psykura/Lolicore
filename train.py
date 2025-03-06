@@ -25,14 +25,14 @@ from flax import linen as nn
 
 # Constants
 CONTEXT_LENGTH = 512
-BATCH_SIZE = 128
+BATCH_SIZE = 8
 NUM_EPOCHS = 10
 LEARNING_RATE = 1e-4
 WARMUP_STEPS = 500
 GRADIENT_CLIP_NORM = 1.0
 DTYPE = jnp.bfloat16  # Set default dtype to bfloat16
 PARALLEL_PROCESSING = 8
-TOKENIZED_DATASET_PATH = '/mnt/data/tokenized_dataset'
+TOKENIZED_DATASET_PATH = "/mnt/data/tokenized_dataset"
 EVAL_STEPS = 1000  # How often to evaluate on test set
 
 vocab_size = 50257
@@ -40,7 +40,7 @@ vocab_size = ((vocab_size + 127) // 128) * 128
 
 # Model hyperparameters
 MODEL_CONFIG = {
-    'num_blocks': 12,
+    'num_blocks': 6,
     'num_heads': 8,
     'd_model': 768,
     'hidden_size': 2048,
@@ -190,7 +190,7 @@ def create_mesh():
     print(f"Total devices: {expert_dim * model_dim * batch_dim}")
     
     # Create mesh with logical axes that match our model's partitioning
-    mesh = jax.make_mesh((expert_dim, model_dim, batch_dim), ('expert', 'model', 'data'))
+    mesh = jax.make_mesh((batch_dim, expert_dim, model_dim), ('data', 'expert', 'model'))
     return mesh, n_devices
 
 def calculate_metrics(logits, labels, mask):
@@ -518,12 +518,14 @@ def main():
         param_count = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
         print(f"Number of parameters: {param_count/1e9:.2f}B")
 
+        train_step = create_train_step(mesh, state_sharding)
+
         if jax.process_index() == 0:
             wandb.run.summary["model_parameters_B"] = param_count/1e9
 
         # Profile one evaluation step before training
         print("\nProfiling one evaluation step...")
-        with jax.profiler.trace(PROFILING_DIR, create_perfetto_link=True, create_perfetto_trace=True):
+        with jax.profiler.trace(PROFILING_DIR, create_perfetto_link=False, create_perfetto_trace=True):
             print("Running profiled evaluation step...")
             # Create a batch from test dataset for profiling
             profile_batch = create_batch(mesh, {
@@ -531,9 +533,12 @@ def main():
                 'attention_mask': test_dataset['attention_mask'],
                 'labels': test_dataset['labels']
             })
+            step = 0
+            rng = jax.random.key(0)
             # Run evaluation step for profiling
-            _ = test_step(state, profile_batch)
+            _, _ = train_step(state, profile_batch, step, rng)
             print("Profiling complete. Check the logs at", PROFILING_DIR)
+        exit(0) # for profiling
 
         start_epoch = step // steps_per_epoch
         start_batch_idx = step % steps_per_epoch
@@ -553,7 +558,6 @@ def main():
         early_stop_patience = 3
 
         # Create the training step function with proper sharding
-        train_step = create_train_step(mesh, state_sharding)
         with mesh:
             for epoch in range(start_epoch, NUM_EPOCHS):
                 shuffled_indices = np.random.RandomState(seed=epoch).permutation(len(train_dataset))
