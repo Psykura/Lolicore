@@ -279,21 +279,22 @@ def create_train_step(mesh, state_sharding):
         in_shardings=(
             state_sharding,  # state sharding
             batch_sharding,  # batch sharding
-            rng_sharding,   # step (converted to PRNGKey) sharding
+            rng_sharding,   # step sharding
             rng_sharding,   # rngs sharding
         ),
         out_shardings=(state_sharding, None)  # state and metrics sharding
     )
-    def train_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray], step: int, rngs: jax.random.PRNGKey):
+    def train_step(state, batch, step, rngs):
         """Perform a single training step."""
         noise_rng = jax.random.fold_in(rngs, step)
 
         def loss_fn(params):
+            # Pass rngs directly in the variables dict
+            variables = {'params': params, 'noise': noise_rng}
             logits, router_loss = state.apply_fn(
-                {'params': params},
+                variables,
                 batch['input_ids'],
-                batch['attention_mask'],
-                rngs={'noise': noise_rng}
+                batch['attention_mask']
             )
             
             metrics = calculate_metrics(logits, batch['labels'], batch['attention_mask'])
@@ -311,6 +312,7 @@ def create_train_step(mesh, state_sharding):
         return new_state, metrics
     
     return train_step
+
 @jax.jit
 def test_step(state: train_state.TrainState, batch: Dict[str, jnp.ndarray]):
     """Perform a single test step."""
@@ -633,7 +635,7 @@ def main():
             for batch_idx in range(start_batch_idx if epoch == start_epoch else 0, steps_per_epoch):
                 try:
                     batch = next(batch_iterator)
-                    state, metrics = train_step(state, batch, step, rngs=rng)
+                    state, metrics = train_step(state, batch, step, rng)
                     progress_bar.update(1)
 
                     if batch_idx % 50 == 0:
