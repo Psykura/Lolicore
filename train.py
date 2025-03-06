@@ -107,32 +107,36 @@ def create_train_state(
         )
     )
 
-    with mesh:
-        print("Initializing model directly on mesh...")
-        # Create dummy inputs with proper sharding
-        dummy_input = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
-        dummy_mask = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
+    print("Initializing model on mesh...")
+    # Create dummy inputs with proper sharding
+    dummy_input = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
+    dummy_mask = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
         
-        # Initialize model directly on the mesh
-        variables = model.init(rngs, dummy_input, dummy_mask)
-        
-        print("Creating optimizer state...")
-        opt_state = optimizer.init(variables['params'])
-        
-        state = train_state.TrainState.create(
-            apply_fn=model.apply,
-            params=variables['params'],
-            tx=optimizer,
-            opt_state=opt_state,
-        )
-        
-        print("Train state created successfully")
-        
-        # Print total parameter count
-        param_count = sum(p.size for p in jax.tree.leaves(variables['params']))
-        print(f"Total parameters: {param_count:,}")
-        
-        return state
+    # Explicitly shard the dummy inputs to distribute initialization computation
+    input_sharding = NamedSharding(mesh, P('data', 'data'))
+    dummy_input = jax.device_put(dummy_input, input_sharding)
+    dummy_mask = jax.device_put(dummy_mask, input_sharding)
+    
+    # Initialize model with sharded inputs
+    variables = model.init(rngs, dummy_input, dummy_mask)
+    
+    print("Creating optimizer state...")
+    opt_state = optimizer.init(variables['params'])
+    
+    state = train_state.TrainState.create(
+        apply_fn=model.apply,
+        params=variables['params'],
+        tx=optimizer,
+        opt_state=opt_state,
+    )
+    
+    print("Train state created successfully")
+    
+    # Print total parameter count
+    param_count = sum(p.size for p in jax.tree.leaves(variables['params']))
+    print(f"Total parameters: {param_count:,}")
+    
+    return state
 
 def create_mesh():
     """Create an optimized device mesh for training MoE models."""
