@@ -172,19 +172,19 @@ def create_mesh():
 
     expert_dim = 1
     model_dim = 1
-    batch_dim = 1
+    batch_dim = n_devices
     
     if n_devices == 0:
         raise ValueError("No JAX devices found. Please check your JAX installation.")
     
-    if n_devices % 4 == 0:
-        expert_dim = 4
-        model_dim = 1
-        batch_dim = n_devices // 4
-    elif n_devices % 8 == 0:
+    if n_devices % 8 == 0:
         expert_dim = 4
         model_dim = 2
         batch_dim = n_devices // 8
+    elif n_devices % 4 == 0:
+        expert_dim = 4
+        model_dim = 1
+        batch_dim = n_devices // 4
     
     print(f"Using 3D mesh with shape: expert={expert_dim}, model={model_dim}, batch={batch_dim}")
     print(f"Total devices: {expert_dim * model_dim * batch_dim}")
@@ -479,7 +479,7 @@ def main():
     PROFILING_DIR = os.path.join(os.path.expanduser("~"), "profiling")
     os.makedirs(PROFILING_DIR, exist_ok=True)
     
-    with jax.profiler.trace(PROFILING_DIR, create_perfetto_link=(jax.process_index() == 0), create_perfetto_trace=True):
+    with jax.profiler.trace(PROFILING_DIR, create_perfetto_link=True, create_perfetto_trace=True):
         with mesh:
             learning_rate_fn = create_learning_rate_schedule(
                 num_train_steps=total_steps,
