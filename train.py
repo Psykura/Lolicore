@@ -119,8 +119,7 @@ def create_train_state(
         state = train_state.TrainState.create(
             apply_fn=model.apply,
             params=variables['params'],
-            tx=optimizer,
-            opt_state=optimizer.init(variables['params'])
+            tx=optimizer
         )
         return state
 
