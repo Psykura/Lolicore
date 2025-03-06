@@ -479,69 +479,82 @@ def main():
     PROFILING_DIR = os.path.join(os.path.expanduser("~"), "profiling")
     os.makedirs(PROFILING_DIR, exist_ok=True)
     
-    with jax.profiler.trace(PROFILING_DIR, create_perfetto_link=True, create_perfetto_trace=True):
+    with mesh:
+        learning_rate_fn = create_learning_rate_schedule(
+            num_train_steps=total_steps,
+            warmup_steps=WARMUP_STEPS,
+            base_learning_rate=LEARNING_RATE
+        )
+
+        rng = jax.random.key(0)
+        rng, init_rng = jax.random.split(rng)
+
+        step = 0
+        state, state_sharding = create_train_state(
+            init_rng,
+            mesh=mesh,
+            learning_rate_fn=learning_rate_fn,
+            **MODEL_CONFIG
+        )
+
+        print(f"Syncing training state for process {jax.process_index()}")
+        sync_global_devices('training_state_created')
+        # Restore from checkpoint
+        just_loaded = False
+        latest_step = async_checkpoint_manager.latest_step()
+        if latest_step is not None:
+            print(f"Restoring from checkpoint at step {latest_step}")
+            step = latest_step
+            loaded_state = async_checkpoint_manager.restore(latest_step)
+            state = state.replace(params=loaded_state['state']['params'])
+            async_checkpoint_manager.wait_until_finished()
+            just_loaded = True
+        else:
+            print("No checkpoint found, training from scratch")
+
+        print(f"Syncing checkpoint loaded for process {jax.process_index()}")
+        sync_global_devices('checkpoint_loaded')
+
+        param_count = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
+        print(f"Number of parameters: {param_count/1e9:.2f}B")
+
+        if jax.process_index() == 0:
+            wandb.run.summary["model_parameters_B"] = param_count/1e9
+
+        # Profile one evaluation step before training
+        print("\nProfiling one evaluation step...")
+        with jax.profiler.trace(PROFILING_DIR, create_perfetto_link=True, create_perfetto_trace=True):
+            print("Running profiled evaluation step...")
+            # Create a batch from test dataset for profiling
+            profile_batch = create_batch(mesh, {
+                'input_ids': test_dataset['input_ids'],
+                'attention_mask': test_dataset['attention_mask'],
+                'labels': test_dataset['labels']
+            })
+            # Run evaluation step for profiling
+            _ = test_step(state, profile_batch)
+            print("Profiling complete. Check the logs at", PROFILING_DIR)
+
+        start_epoch = step // steps_per_epoch
+        start_batch_idx = step % steps_per_epoch
+
+        print(f"Syncing starting training for process {jax.process_index()}")
+        sync_global_devices('starting_training')
+
+        print(f"Starting training from step {step} (epoch {start_epoch}, batch {start_batch_idx})")
+
+        # Track best metrics
+        best_metrics = {
+            'train_loss': float('inf'),
+            'test_loss': float('inf'),
+            'test_perplexity': float('inf')
+        }
+        plateau_count = 0
+        early_stop_patience = 3
+
+        # Create the training step function with proper sharding
+        train_step = create_train_step(mesh, state_sharding)
         with mesh:
-            learning_rate_fn = create_learning_rate_schedule(
-                num_train_steps=total_steps,
-                warmup_steps=WARMUP_STEPS,
-                base_learning_rate=LEARNING_RATE
-            )
-
-            rng = jax.random.key(0)
-            rng, init_rng = jax.random.split(rng)
-
-            step = 0
-            state, state_sharding = create_train_state(
-                init_rng,
-                mesh=mesh,
-                learning_rate_fn=learning_rate_fn,
-                **MODEL_CONFIG
-            )
-
-            print(f"Syncing training state for process {jax.process_index()}")
-            sync_global_devices('training_state_created')
-            # Restore from checkpoint
-            just_loaded = False
-            latest_step = async_checkpoint_manager.latest_step()
-            if latest_step is not None:
-                print(f"Restoring from checkpoint at step {latest_step}")
-                step = latest_step
-                loaded_state = async_checkpoint_manager.restore(latest_step)
-                state = state.replace(params=loaded_state['state']['params'])
-                async_checkpoint_manager.wait_until_finished()
-                just_loaded = True
-            else:
-                print("No checkpoint found, training from scratch")
-
-            print(f"Syncing checkpoint loaded for process {jax.process_index()}")
-            sync_global_devices('checkpoint_loaded')
-
-            param_count = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
-            print(f"Number of parameters: {param_count/1e9:.2f}B")
-
-            if jax.process_index() == 0:
-                wandb.run.summary["model_parameters_B"] = param_count/1e9
-
-            start_epoch = step // steps_per_epoch
-            start_batch_idx = step % steps_per_epoch
-
-            print(f"Syncing starting training for process {jax.process_index()}")
-            sync_global_devices('starting_training')
-
-            print(f"Starting training from step {step} (epoch {start_epoch}, batch {start_batch_idx})")
-
-            # Track best metrics
-            best_metrics = {
-                'train_loss': float('inf'),
-                'test_loss': float('inf'),
-                'test_perplexity': float('inf')
-            }
-            plateau_count = 0
-            early_stop_patience = 3
-
-            # Create the training step function with proper sharding
-            train_step = create_train_step(mesh, state_sharding)
-
             for epoch in range(start_epoch, NUM_EPOCHS):
                 shuffled_indices = np.random.RandomState(seed=epoch).permutation(len(train_dataset))
 
