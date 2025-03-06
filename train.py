@@ -111,9 +111,10 @@ def create_train_state(
     # Create dummy inputs with proper sharding
     dummy_input = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
     dummy_mask = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
-        
+    
     # Explicitly shard the dummy inputs to distribute initialization computation
-    input_sharding = NamedSharding(mesh, P('data', 'data'))
+    # Use 'data' axis for batch dimension and None for sequence dimension
+    input_sharding = NamedSharding(mesh, P('data', None))
     dummy_input = jax.device_put(dummy_input, input_sharding)
     dummy_mask = jax.device_put(dummy_mask, input_sharding)
     
