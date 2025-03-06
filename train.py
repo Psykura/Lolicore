@@ -124,46 +124,44 @@ def create_train_state(
     rng, params_rng, dropout_rng, noise_rng = jax.random.split(rng, 4)
     rngs = {'params': params_rng, 'dropout': dropout_rng, 'noise': noise_rng}
 
-    print("Initializing model...")
-    # Create dummy inputs directly as sharded arrays
-    with mesh:
-        dummy_input = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
-        dummy_mask = jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32)
-        
-        # Initialize variables directly within mesh context
-        variables = model.init(rngs, dummy_input, dummy_mask)
-        print("Model initialization complete")
+    print("Initializing model on CPU...")
+    cpu_device = jax.devices("cpu")[0]
+    cpu_dummy_input = jax.device_put(jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32), cpu_device)
+    cpu_dummy_mask = jax.device_put(jnp.ones((BATCH_SIZE, CONTEXT_LENGTH), dtype=jnp.int32), cpu_device)
 
-        print("Setting up optimizer and parameter sharding...")
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(GRADIENT_CLIP_NORM),
-            optax.adamw(
-                learning_rate=learning_rate_fn,
-                weight_decay=0.005,
-                b1=0.9,
-                b2=0.95,
-                eps=1e-8,
-            )
+    with jax.default_device(cpu_device):
+        cpu_variables = model.init(rngs, cpu_dummy_input, cpu_dummy_mask)
+    print("CPU initialization complete")
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(GRADIENT_CLIP_NORM),
+        optax.adamw(
+            learning_rate=learning_rate_fn,
+            weight_decay=0.005,
+            b1=0.9,
+            b2=0.95,
+            eps=1e-8,
         )
+    )
 
-        print("Setting up parameter sharding...")
+    with mesh:
+        print("Transferring parameters to mesh...")
         param_shardings = jax.tree.map_with_path(
             lambda path, p: NamedSharding(mesh, get_param_spec_validated(p, path)),
-            variables['params']
+            cpu_variables['params']
         )
 
         if jax.process_index() == 0:
             print("Parameters with inconsistent dimensions:")
             jax.tree.map_with_path(
                 lambda path, p, s: check_param_spec_consistency(path, p, s),
-                variables['params'],
+                cpu_variables['params'],
                 param_shardings
             )
-            debug_param_sharding(variables['params'], param_shardings)
+            debug_param_sharding(cpu_variables['params'], param_shardings)
 
-        # Directly create sharded parameters
-        sharded_params = jax.device_put(variables['params'], param_shardings)
-        print("Parameter sharding complete")
+        sharded_params = jax.device_put(cpu_variables['params'], param_shardings)
+        print("Parameter transfer complete")
 
         return train_state.TrainState.create(
             apply_fn=model.apply,
@@ -642,9 +640,6 @@ def evaluate_model(state, test_dataset, mesh):
     return {k: float(v) for k, v in metrics.items()}
 
 def main():
-    # Initialize JAX distributed system
-    jax.distributed.initialize()
-    
     tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True)
     train_dataset, test_dataset, dataset_size = prepare_dataset(tokenizer)
 
@@ -683,8 +678,6 @@ def main():
     sync_global_devices('mesh_created')
 
     # Initialize async checkpoint manager
-    async_checkpointer = ocp.AsyncCheckpointer(ocp.PyTreeCheckpointHandler(), timeout_secs=50)
-    async_checkpoint_manager = ocp.CheckpointManager(CHECKPOINT_DIR, async_checkpointer, options=ocp.CheckpointManagerOptions(max_to_keep=2))
 
     samples_per_step = BATCH_SIZE
     steps_per_epoch = len(train_dataset) // samples_per_step
@@ -715,6 +708,10 @@ def main():
 
         print(f"Syncing training state for process {jax.process_index()}")
         sync_global_devices('training_state_created')
+
+        jax.distributed.initialize()
+        async_checkpointer = ocp.AsyncCheckpointer(ocp.PyTreeCheckpointHandler(), timeout_secs=50)
+        async_checkpoint_manager = ocp.CheckpointManager(CHECKPOINT_DIR, async_checkpointer, options=ocp.CheckpointManagerOptions(max_to_keep=2))
 
         # Restore from checkpoint
         just_loaded = False
@@ -877,6 +874,7 @@ def main():
 
         if jax.process_index() == 0:
             wandb.finish()
+            jax.distributed.shutdown()
 
 if __name__ == "__main__":
     main()
