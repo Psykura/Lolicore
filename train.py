@@ -640,6 +640,9 @@ def evaluate_model(state, test_dataset, mesh):
     return {k: float(v) for k, v in metrics.items()}
 
 def main():
+    # Initialize JAX distributed system
+    jax.distributed.initialize()
+    
     tokenizer = AutoTokenizer.from_pretrained('gpt2', trust_remote_code=True)
     train_dataset, test_dataset, dataset_size = prepare_dataset(tokenizer)
 
